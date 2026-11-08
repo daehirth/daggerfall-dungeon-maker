@@ -1,0 +1,210 @@
+//! Parser for RDB dungeon blocks stored in `BLOCKS.BSA`.
+//!
+//! Each dungeon in Daggerfall is assembled from square blocks of 2048 native
+//! units. An RDB block contains a table of model identifiers followed by
+//! several linked lists of objects: 3D models, flats (billboard sprites,
+//! including editor markers for enemies, treasure and quest locations) and
+//! light sources.
+
+use std::collections::HashSet;
+
+use glam::IVec3;
+
+use super::error::{Arena2Error, Arena2Result};
+use super::reader::ByteReader;
+use super::TextureKey;
+
+/// Number of entries in the model reference table of every RDB block.
+const MODEL_REFERENCE_COUNT: usize = 750;
+/// Size of one model reference entry: a five character id and a three character tag.
+const MODEL_REFERENCE_SIZE: usize = 8;
+/// Size of the block header that precedes the model reference table.
+const BLOCK_HEADER_SIZE: usize = 20;
+/// Safety limit for linked list traversal, far above anything found in game data.
+const MAX_OBJECTS_PER_LIST: usize = 100_000;
+
+/// Resource type tag for a 3D model object.
+const RESOURCE_TYPE_MODEL: u8 = 0x01;
+/// Resource type tag for a light object.
+const RESOURCE_TYPE_LIGHT: u8 = 0x02;
+/// Resource type tag for a flat (billboard) object.
+const RESOURCE_TYPE_FLAT: u8 = 0x03;
+
+/// A fully parsed RDB dungeon block.
+#[derive(Debug, Clone)]
+pub struct RdbBlock {
+    /// Block file name, for example `N0000004.RDB`.
+    pub name: String,
+    /// Every object found in the block, in file order.
+    pub objects: Vec<RdbObject>,
+}
+
+/// An object placed inside an RDB block.
+#[derive(Debug, Clone)]
+pub struct RdbObject {
+    /// Index of the object list this object came from. Lists roughly correspond to rooms.
+    pub group_index: usize,
+    /// Position in native Daggerfall units relative to the block origin.
+    pub position: IVec3,
+    /// Type specific data.
+    pub kind: RdbObjectKind,
+}
+
+/// The type specific part of an [`RdbObject`].
+#[derive(Debug, Clone)]
+pub enum RdbObjectKind {
+    /// A static or animated 3D model.
+    Model(RdbModel),
+    /// A billboard sprite or editor marker.
+    Flat(RdbFlat),
+    /// A point light.
+    Light(RdbLight),
+}
+
+/// Model specific object data.
+#[derive(Debug, Clone)]
+pub struct RdbModel {
+    /// Record identifier of the model in `ARCH3D.BSA`.
+    pub model_id: u32,
+    /// Rotation around each axis in native units (2048 units per full turn).
+    pub rotation: IVec3,
+    /// Whether the model has an action (door, lever, moving platform and so on).
+    pub has_action: bool,
+}
+
+/// Flat specific object data.
+#[derive(Debug, Clone)]
+pub struct RdbFlat {
+    /// Texture shown by the billboard.
+    pub texture: TextureKey,
+    /// Raw flag bits (gender for enemies, behaviour for some markers).
+    pub flags: u16,
+}
+
+/// Light specific object data.
+#[derive(Debug, Clone)]
+pub struct RdbLight {
+    /// Light radius in native units.
+    pub radius: u16,
+}
+
+/// The base fields shared by every object in a linked list.
+struct ObjectHeader {
+    position: IVec3,
+    resource_type: u8,
+    resource_offset: usize,
+}
+
+/// Parses the RDB block called `name` from its raw bytes.
+pub fn parse_rdb_block(name: &str, data: &[u8]) -> Arena2Result<RdbBlock> {
+    let mut header = ByteReader::new(data);
+    let _unknown = header.read_u32()?;
+    let width = header.read_u32()? as usize;
+    let height = header.read_u32()? as usize;
+    let object_root_offset = header.read_u32()? as usize;
+
+    let model_ids = read_model_reference_table(data)?;
+
+    let mut root_reader = ByteReader::at(data, object_root_offset);
+    let mut objects = Vec::new();
+    for group_index in 0..width * height {
+        let root_offset = root_reader.read_i32()?;
+        let Ok(root_offset) = usize::try_from(root_offset) else {
+            continue; // A negative root marks an empty group.
+        };
+        read_object_list(data, root_offset, group_index, &model_ids, &mut objects)?;
+    }
+
+    Ok(RdbBlock { name: name.to_string(), objects })
+}
+
+/// Reads the table that maps a model index to an `ARCH3D.BSA` model id.
+fn read_model_reference_table(data: &[u8]) -> Arena2Result<Vec<Option<u32>>> {
+    let mut reader = ByteReader::at(data, BLOCK_HEADER_SIZE);
+    (0..MODEL_REFERENCE_COUNT)
+        .map(|_| {
+            let entry = reader.read_bytes(MODEL_REFERENCE_SIZE)?;
+            let id_text: String =
+                entry[..5].iter().take_while(|&&byte| byte != 0).map(|&byte| byte as char).collect();
+            Ok(id_text.trim().parse::<u32>().ok())
+        })
+        .collect()
+}
+
+/// Walks one linked list of objects, appending every recognised object to `objects`.
+fn read_object_list(
+    data: &[u8],
+    root_offset: usize,
+    group_index: usize,
+    model_ids: &[Option<u32>],
+    objects: &mut Vec<RdbObject>,
+) -> Arena2Result<()> {
+    let mut visited_offsets = HashSet::new();
+    let mut next_offset = Some(root_offset);
+
+    while let Some(offset) = next_offset {
+        if !visited_offsets.insert(offset) || visited_offsets.len() > MAX_OBJECTS_PER_LIST {
+            return Err(Arena2Error::format("RDB object list contains a loop"));
+        }
+
+        let mut reader = ByteReader::at(data, offset);
+        let next = reader.read_i32()?;
+        let _previous = reader.read_i32()?;
+        let object_header = ObjectHeader {
+            position: IVec3::new(reader.read_i32()?, reader.read_i32()?, reader.read_i32()?),
+            resource_type: reader.read_u8()?,
+            resource_offset: reader.read_u32()? as usize,
+        };
+
+        if let Some(kind) = read_object_resource(data, &object_header, model_ids)? {
+            objects.push(RdbObject { group_index, position: object_header.position, kind });
+        }
+
+        next_offset = usize::try_from(next).ok();
+    }
+    Ok(())
+}
+
+/// Reads the type specific resource data of an object.
+///
+/// Returns `Ok(None)` for objects that should be skipped, such as models that
+/// reference an empty slot of the model table.
+fn read_object_resource(
+    data: &[u8],
+    object_header: &ObjectHeader,
+    model_ids: &[Option<u32>],
+) -> Arena2Result<Option<RdbObjectKind>> {
+    let mut reader = ByteReader::at(data, object_header.resource_offset);
+
+    let kind = match object_header.resource_type {
+        RESOURCE_TYPE_MODEL => {
+            let rotation = IVec3::new(reader.read_i32()?, reader.read_i32()?, reader.read_i32()?);
+            let model_index = usize::from(reader.read_u16()?);
+            let _trigger_flag_and_starting_lock = reader.read_u32()?;
+            let _sound_index = reader.read_u8()?;
+            let action_offset = reader.read_i32()?;
+
+            let Some(model_id) = model_ids.get(model_index).copied().flatten() else {
+                log::warn!("RDB model object references empty model slot {model_index}");
+                return Ok(None);
+            };
+            RdbObjectKind::Model(RdbModel { model_id, rotation, has_action: action_offset > 0 })
+        }
+        RESOURCE_TYPE_FLAT => {
+            let texture = TextureKey::from_bitfield(reader.read_u16()?);
+            let flags = reader.read_u16()?;
+            RdbObjectKind::Flat(RdbFlat { texture, flags })
+        }
+        RESOURCE_TYPE_LIGHT => {
+            let _unknown_1 = reader.read_u32()?;
+            let _unknown_2 = reader.read_u32()?;
+            let radius = reader.read_u16()?;
+            RdbObjectKind::Light(RdbLight { radius })
+        }
+        other => {
+            log::warn!("skipping RDB object with unknown resource type {other}");
+            return Ok(None);
+        }
+    };
+    Ok(Some(kind))
+}

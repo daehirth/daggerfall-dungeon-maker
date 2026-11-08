@@ -1,7 +1,9 @@
 /target
 
 # Never commit game data. The program reads it from the user's own ARENA2 folder at run time.
-ARENA2/
+# Anchored to the repository root: git on Windows ignores case, and an unanchored
+# "ARENA2/" would also match the src/arena2/ source folder.
+/ARENA2/
 *.BSA
 TEXTURE.*
 *.COL
