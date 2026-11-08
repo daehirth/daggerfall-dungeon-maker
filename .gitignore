@@ -1,0 +1,8 @@
+/target
+
+# Never commit game data. The program reads it from the user's own ARENA2 folder at run time.
+ARENA2/
+*.BSA
+TEXTURE.*
+*.COL
+*.PAL
