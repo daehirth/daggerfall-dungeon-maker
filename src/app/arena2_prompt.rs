@@ -6,13 +6,32 @@ use eframe::egui;
 
 use crate::arena2::Arena2Library;
 
-/// Install locations checked to pre-fill the folder field.
-const COMMON_INSTALL_PATHS: [&str; 4] = [
-    r"SteamLibrary\steamapps\common\The Elder Scrolls Daggerfall\DF\DAGGER\ARENA2",
-    r"Program Files (x86)\Steam\steamapps\common\The Elder Scrolls Daggerfall\DF\DAGGER\ARENA2",
-    r"Program Files\Steam\steamapps\common\The Elder Scrolls Daggerfall\DF\DAGGER\ARENA2",
-    r"GOG Games\Daggerfall\DAGGER\ARENA2",
+/// Install locations relative to a Windows drive root (or a mounted Windows drive on Linux),
+/// checked to pre-fill the folder field.
+const WINDOWS_INSTALL_PATHS: [&str; 4] = [
+    "SteamLibrary/steamapps/common/The Elder Scrolls Daggerfall/DF/DAGGER/ARENA2",
+    "Program Files (x86)/Steam/steamapps/common/The Elder Scrolls Daggerfall/DF/DAGGER/ARENA2",
+    "Program Files/Steam/steamapps/common/The Elder Scrolls Daggerfall/DF/DAGGER/ARENA2",
+    "GOG Games/Daggerfall/DAGGER/ARENA2",
 ];
+
+/// Install locations relative to the home folder on Linux: native, Flatpak and Snap
+/// Steam, and a GOG copy.
+#[cfg(not(windows))]
+const LINUX_INSTALL_PATHS: [&str; 6] = [
+    ".local/share/Steam/steamapps/common/The Elder Scrolls Daggerfall/DF/DAGGER/ARENA2",
+    ".steam/steam/steamapps/common/The Elder Scrolls Daggerfall/DF/DAGGER/ARENA2",
+    ".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/The Elder Scrolls Daggerfall/DF/DAGGER/ARENA2",
+    "snap/steam/common/.local/share/Steam/steamapps/common/The Elder Scrolls Daggerfall/DF/DAGGER/ARENA2",
+    "GOG Games/Daggerfall/DAGGER/ARENA2",
+    "Games/Daggerfall/DAGGER/ARENA2",
+];
+
+/// Example shown in the empty folder field.
+#[cfg(windows)]
+const FOLDER_HINT: &str = r"...\DAGGER\ARENA2";
+#[cfg(not(windows))]
+const FOLDER_HINT: &str = ".../DAGGER/ARENA2";
 
 /// State of the ARENA2 folder prompt.
 pub struct Arena2Prompt {
@@ -66,7 +85,7 @@ impl Arena2Prompt {
 
                 ui.horizontal(|ui| {
                     let path_field = egui::TextEdit::singleline(&mut self.folder_text)
-                        .hint_text(r"...\DAGGER\ARENA2")
+                        .hint_text(FOLDER_HINT)
                         .desired_width(400.0);
                     let field_response = ui.add(path_field);
                     if field_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
@@ -125,13 +144,33 @@ impl Arena2Prompt {
     }
 }
 
-/// Looks for Daggerfall in a few common install locations on every drive.
+/// Looks for Daggerfall in a few common install locations.
 fn detect_installed_folder() -> Option<PathBuf> {
-    ('C'..='Z')
-        .flat_map(|drive| {
-            COMMON_INSTALL_PATHS
-                .iter()
-                .map(move |relative| PathBuf::from(format!("{drive}:\\")).join(relative))
-        })
-        .find(|candidate| Arena2Library::missing_files(candidate).is_empty())
+    install_candidates().find(|candidate| Arena2Library::missing_files(candidate).is_empty())
+}
+
+/// Every drive letter, each joined with the common Windows install locations.
+#[cfg(windows)]
+fn install_candidates() -> impl Iterator<Item = PathBuf> {
+    windows_drive_candidates(|drive| PathBuf::from(format!("{drive}:\\")))
+}
+
+/// The common Linux install locations under the home folder, then Windows
+/// drives mounted under `/mnt` (as WSL does), so a Windows install is found too.
+#[cfg(not(windows))]
+fn install_candidates() -> impl Iterator<Item = PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home_candidates =
+        home.into_iter().flat_map(|home| LINUX_INSTALL_PATHS.iter().map(move |relative| home.join(relative)));
+    home_candidates.chain(windows_drive_candidates(|drive| {
+        PathBuf::from(format!("/mnt/{}", drive.to_ascii_lowercase()))
+    }))
+}
+
+/// Joins each drive root produced by `drive_root` with every Windows install location.
+fn windows_drive_candidates(drive_root: fn(char) -> PathBuf) -> impl Iterator<Item = PathBuf> {
+    ('C'..='Z').flat_map(move |drive| {
+        let root = drive_root(drive);
+        WINDOWS_INSTALL_PATHS.iter().map(move |relative| root.join(relative))
+    })
 }

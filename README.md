@@ -7,26 +7,54 @@ blocks) of *The Elder Scrolls II: Daggerfall*, written in Rust.
 
 No game data is included in or generated into this repository. On first launch
 the program asks for your Daggerfall `ARENA2` folder (for example
-`...\steamapps\common\The Elder Scrolls Daggerfall\DF\DAGGER\ARENA2`) and reads
+`.../steamapps/common/The Elder Scrolls Daggerfall/DF/DAGGER/ARENA2`) and reads
 `ARCH3D.BSA`, `BLOCKS.BSA`, `MAPS.BSA` (optional, for dungeons), `ART_PAL.COL`
-and the `TEXTURE.###` files from it at run time. Only the folder path is
-remembered between runs (in the app's settings under `%APPDATA%`); change it
-with **File > Set ARENA2 folder…**.
+and the `TEXTURE.###` files from it at run time. File names may be upper or
+lower case. Common Steam and GOG install locations are detected automatically.
+
+Only the folder path is remembered between runs, in the app's settings
+(`%APPDATA%\Daggerfall Dungeon Maker` on Windows,
+`~/.local/share/daggerfalldungeonmaker` on Linux); change it with
+**File > Set ARENA2 folder…**.
 
 ## Building
 
+The program runs on Windows and Linux.
+
+### Windows
+
 ```powershell
-.\build.ps1
+.uild.ps1
 ```
 
 This runs `cargo build --release` and produces
 `target\release\daggerfall-dungeon-maker.exe`. With the GNU Rust toolchain, MinGW-w64
 must be installed (`scoop install mingw`); see `build.ps1` for details.
 
+### Linux
+
+Install Rust from <https://rustup.rs> and the system libraries used for the
+window, file dialogs and graphics. On Debian or Ubuntu:
+
+```sh
+sudo apt install build-essential pkg-config libgtk-3-dev libxkbcommon-dev   libwayland-dev libx11-dev mesa-vulkan-drivers
+```
+
+Then build:
+
+```sh
+./build.sh
+```
+
+This produces `target/release/daggerfall-dungeon-maker`. A Vulkan or OpenGL
+capable graphics driver is needed to run it. Both X11 and Wayland desktops work.
+
+### Command line
+
 Optional command line arguments:
 
 ```text
-daggerfall-dungeon-maker.exe [--arena2 <folder>] [--room <name.RDB>] [--dungeon <name>]
+daggerfall-dungeon-maker [--arena2 <folder>] [--room <name.RDB>] [--dungeon <name>]
 ```
 
 ## Using the viewer

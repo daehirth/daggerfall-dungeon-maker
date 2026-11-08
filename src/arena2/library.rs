@@ -298,11 +298,15 @@ mod tests {
         std::fs::write(arena2.join("arch3d.bsa"), b"").unwrap();
 
         let found = find_path(&folder, "DAGGER/ARENA2/ARCH3D.BSA");
+        let found_is_file = found.as_ref().is_some_and(|path| path.is_file());
         let missing = find_path(&folder, "DAGGER/ARENA2/BLOCKS.BSA");
         let indexed = index_files(&arena2);
         std::fs::remove_dir_all(&folder).unwrap();
 
-        assert_eq!(found, Some(arena2.join("arch3d.bsa")));
+        // On case-insensitive file systems the typed case is kept, so compare without case.
+        let found = found.expect("ARCH3D.BSA should be found");
+        assert!(found_is_file);
+        assert!(found.to_string_lossy().eq_ignore_ascii_case(&arena2.join("arch3d.bsa").to_string_lossy()));
         assert_eq!(missing, None);
         assert_eq!(indexed.get("ARCH3D.BSA"), Some(&arena2.join("arch3d.bsa")));
     }
