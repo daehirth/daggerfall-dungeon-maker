@@ -19,7 +19,7 @@ mod mesh;
 mod reader;
 mod texture;
 
-pub use blocks::{RdbBlock, RdbObject, RdbObjectKind};
+pub use blocks::{RdbAction, RdbBlock, RdbObject, RdbObjectKind};
 pub use error::{Arena2Error, Arena2Result};
 pub use library::Arena2Library;
 pub use maps::{DungeonBlockPlacement, DungeonDefinition};

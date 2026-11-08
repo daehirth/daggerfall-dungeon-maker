@@ -13,12 +13,16 @@ mod viewport;
 use eframe::{egui, egui_wgpu};
 use glam::Vec3;
 
+use super::project_panel::OpenedItem;
 use super::viewport_tools::EditorResources;
-use crate::arena2::{Arena2Library, RDB_BLOCK_SIDE};
+use crate::arena2::{Arena2Library, DoorKind, RDB_BLOCK_SIDE};
 use crate::camera::OrbitCamera;
 use crate::encounters::{enemy_chances, DungeonType, EncounterTable, EnemyChance};
-use crate::render::{ViewSettings, ViewportTarget};
-use crate::scene::{Scene, SceneObjectKind};
+use crate::render::{RoomOutline, ViewSettings, ViewportTarget};
+use crate::scene::{
+    ActionMotion, ObjectAction, ObjectId, Scene, SceneObject, SceneObjectKind, OPEN_DOOR_ACTION,
+    OUTSIDE_CELL_TOLERANCE,
+};
 use asset_palette::AssetPalette;
 use history::{EditHistory, SceneEdit};
 use viewport::ViewportState;
@@ -65,7 +69,12 @@ pub struct RoomEditor {
     title: String,
     /// Prefix for widget ids so several editors can be open at once.
     id: egui::Id,
+    /// The selected object; with several selected, the one selected last.
     selected_object: Option<usize>,
+    /// Every selected object when several are (including `selected_object`). It
+    /// only counts while it contains `selected_object`, so selecting one object
+    /// any other way ends the multiple selection.
+    selection_set: Vec<usize>,
     camera: OrbitCamera,
     view_settings: ViewSettings,
     snap: SnapSettings,
@@ -88,6 +97,106 @@ pub struct RoomEditor {
     dungeon_type: Option<DungeonType>,
     /// Player level used to preview which enemies random enemy markers can become.
     enemy_preview_level: u32,
+    /// Dungeons that use this cell, listed under "Used in"; set by the application.
+    used_in: Vec<UsedInEntry>,
+    /// A dungeon the user double-clicked under "Used in", for the application to open.
+    open_request: Option<OpenedItem>,
+    /// An action being played back in the viewport, if any.
+    preview: Option<ActionPreview>,
+    /// The dungeon selected under "Used in", whose other cells are shown faded around this one.
+    selected_dungeon: Option<OpenedItem>,
+    /// The dungeon and layout place this cell was opened at, so the cells around
+    /// that place (not another use of the same cell) are shown for that dungeon.
+    home_placement: Option<(OpenedItem, usize)>,
+    /// How far each object reaches outside the cell's square, refreshed every frame.
+    outside_cell: Vec<f32>,
+    /// A surrounding cell the user double-clicked: its dungeon and layout place.
+    cell_open_request: Option<(OpenedItem, usize)>,
+    /// Set when the dungeon was selected for the user, so its row scrolls into view once.
+    scroll_to_selected_dungeon: bool,
+    /// Set when `selected_dungeon` changes, for the application to load its cells.
+    context_request: Option<Option<OpenedItem>>,
+    /// The selected dungeon's other cells, placed around this one, and their outlines.
+    dungeon_context: Option<DungeonContext>,
+}
+
+/// The cells around the edited one in a dungeon, shown faded for context.
+pub struct DungeonContext {
+    /// The dungeon they belong to.
+    pub dungeon: OpenedItem,
+    /// Their objects, positioned relative to the edited cell. Each object's
+    /// `group_index` is the index of its cell in `cells`.
+    pub scene: Scene,
+    /// Outlines of the edited cell (first, at the origin) and of each surrounding
+    /// cell, in the order of `cells`.
+    pub outlines: Vec<RoomOutline>,
+    /// The surrounding cells.
+    pub cells: Vec<ContextCell>,
+}
+
+/// One cell shown faded around the edited one.
+pub struct ContextCell {
+    /// Name shown when the pointer is over it.
+    pub label: String,
+    /// Its place in the dungeon's layout.
+    pub layout_index: usize,
+}
+
+/// How long a finished preview stays in its end state before everything returns.
+const PREVIEW_HOLD_SECONDS: f64 = 0.5;
+
+/// An action chain being played back in the viewport, without changing the cell.
+struct ActionPreview {
+    /// Time the preview started, from egui's clock.
+    started: f64,
+    /// Each moving object and how it moves; they all start together, as in the game.
+    motions: Vec<(usize, ActionMotion)>,
+}
+
+/// A dungeon listed under "Used in".
+pub struct UsedInEntry {
+    pub label: String,
+    pub item: OpenedItem,
+}
+
+/// What the right-click menu of an object offers.
+pub(super) struct ObjectMenuInfo {
+    name: String,
+    /// Whether the object can have an action (models and flats).
+    can_tie: bool,
+    /// How many objects' actions trigger this object.
+    triggered_by: usize,
+}
+
+/// What the user chose in an object's right-click menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObjectMenuChoice {
+    TieAction,
+    RemoveActions,
+}
+
+/// Draws the entries of an object's right-click menu. Returns the user's choice.
+pub(super) fn object_menu(ui: &mut egui::Ui, info: &ObjectMenuInfo) -> Option<ObjectMenuChoice> {
+    let mut choice = None;
+    ui.label(egui::RichText::new(&info.name).weak());
+    if info.can_tie
+        && ui.button("Tie action to…").on_hover_text("Choose the object this one's action triggers").clicked()
+    {
+        choice = Some(ObjectMenuChoice::TieAction);
+    }
+    if info.triggered_by > 0 {
+        let hover = format!("Remove the action of the {} object(s) that trigger this one", info.triggered_by);
+        if ui.button("Remove actions").on_hover_text(hover).clicked() {
+            choice = Some(ObjectMenuChoice::RemoveActions);
+        }
+    }
+    if !info.can_tie && info.triggered_by == 0 {
+        ui.label(egui::RichText::new("Lights cannot have actions").weak());
+    }
+    if choice.is_some() {
+        ui.close_menu();
+    }
+    choice
 }
 
 impl RoomEditor {
@@ -99,6 +208,7 @@ impl RoomEditor {
             title,
             id,
             selected_object: None,
+            selection_set: Vec::new(),
             camera: OrbitCamera::default(),
             view_settings: ViewSettings::default(),
             snap: SnapSettings::default(),
@@ -114,6 +224,16 @@ impl RoomEditor {
             project_room_name: None,
             dungeon_type: None,
             enemy_preview_level: 1,
+            used_in: Vec::new(),
+            open_request: None,
+            preview: None,
+            selected_dungeon: None,
+            scroll_to_selected_dungeon: false,
+            home_placement: None,
+            cell_open_request: None,
+            outside_cell: Vec::new(),
+            context_request: None,
+            dungeon_context: None,
         };
         editor.frame_room(library);
         if let Some((minimum, _)) = editor.scene.bounds(library) {
@@ -165,6 +285,231 @@ impl RoomEditor {
         self.encounter_table(object_index).map(|table| enemy_chances(table, self.enemy_preview_level))
     }
 
+    /// What moves when object `start`'s action is triggered: every object down
+    /// its action chain, to the end, whose action moves it, each with its motion.
+    /// Doors whose action opens them swing open. Empty if nothing moves.
+    pub(super) fn preview_motions(
+        &self,
+        start: usize,
+        library: &mut Arena2Library,
+    ) -> Vec<(usize, ActionMotion)> {
+        let mut motions = Vec::new();
+        for index in self.scene.action_chain(start) {
+            match self.scene.objects[index].kind {
+                SceneObjectKind::Model { model_id, data } => {
+                    let Some(action) = data.action else { continue };
+                    if let Some(motion) = action.motion() {
+                        motions.push((index, motion));
+                    } else if action.action_type == OPEN_DOOR_ACTION
+                        && library.model(model_id).and_then(|mesh| mesh.door_kind())
+                            == Some(DoorKind::Building)
+                    {
+                        motions.push((index, ActionMotion::door_swing()));
+                    }
+                }
+                SceneObjectKind::Flat { data, .. } if data.action != 0 => {
+                    // Flats' actions use their magnitude byte as both axis and magnitude, with no duration.
+                    let [magnitude, _] = data.faction_or_mobile_id.to_le_bytes();
+                    let action = ObjectAction {
+                        action_type: data.action,
+                        axis: magnitude,
+                        duration: 0,
+                        magnitude: u16::from(magnitude),
+                    };
+                    if let Some(motion) = action.motion() {
+                        motions.push((index, motion));
+                    }
+                }
+                _ => {}
+            }
+        }
+        motions
+    }
+
+    /// Starts playing object `index`'s action chain in the viewport.
+    pub(super) fn start_preview(&mut self, index: usize, now: f64, library: &mut Arena2Library) {
+        let motions = self.preview_motions(index, library);
+        if !motions.is_empty() {
+            self.status_message = format!("Previewing {} moving object(s)", motions.len());
+            self.preview = Some(ActionPreview { started: now, motions });
+        }
+    }
+
+    /// The scene as it looks at time `now` during a preview, or `None` when no
+    /// preview is playing. A preview ends half a second after its slowest motion.
+    pub(super) fn preview_scene(&mut self, now: f64) -> Option<Scene> {
+        let preview = self.preview.as_ref()?;
+        let elapsed = now - preview.started;
+        let longest = preview.motions.iter().map(|(_, motion)| f64::from(motion.seconds)).fold(0.0, f64::max);
+        if elapsed > longest + PREVIEW_HOLD_SECONDS {
+            self.preview = None;
+            return None;
+        }
+        let mut scene = self.scene.clone();
+        for (index, motion) in &preview.motions {
+            let fraction = if motion.seconds <= 0.0 {
+                1.0
+            } else {
+                (elapsed / f64::from(motion.seconds)).min(1.0) as f32
+            };
+            if let Some(object) = scene.objects.get_mut(*index) {
+                *object = object.moved_by(motion, fraction);
+            }
+        }
+        Some(scene)
+    }
+
+    /// Sets the dungeons listed under "Used in".
+    pub fn set_used_in(&mut self, used_in: Vec<UsedInEntry>) {
+        self.used_in = used_in;
+    }
+
+    /// Returns, once, the dungeon newly selected under "Used in" (or `Some(None)`
+    /// when the selection was cleared), so its cells can be loaded with
+    /// [`Self::set_dungeon_context`].
+    pub fn take_context_request(&mut self) -> Option<Option<OpenedItem>> {
+        self.context_request.take()
+    }
+
+    /// How far object `index` reaches outside the cell's square, in world units.
+    pub(super) fn distance_outside_cell(&self, index: usize, library: &mut Arena2Library) -> f32 {
+        let Some(object) = self.scene.objects.get(index) else { return 0.0 };
+        object_distance_outside_cell(object, library)
+    }
+
+    /// Whether object `index` reaches noticeably outside the cell's square (as of this frame).
+    pub(super) fn is_outside_cell(&self, index: usize) -> bool {
+        self.outside_cell.get(index).is_some_and(|&distance| distance > OUTSIDE_CELL_TOLERANCE)
+    }
+
+    /// Records which place in `dungeon`'s layout this cell was opened at.
+    pub fn set_home_placement(&mut self, dungeon: OpenedItem, layout_index: usize) {
+        self.home_placement = Some((dungeon, layout_index));
+    }
+
+    /// The layout place this cell was opened at in `dungeon`, if it was opened from it.
+    pub fn home_layout_index(&self, dungeon: &OpenedItem) -> Option<usize> {
+        self.home_placement.as_ref().filter(|(home, _)| home == dungeon).map(|&(_, index)| index)
+    }
+
+    /// Returns, once, a surrounding cell the user double-clicked to open.
+    pub fn take_cell_open_request(&mut self) -> Option<(OpenedItem, usize)> {
+        self.cell_open_request.take()
+    }
+
+    /// Sets the cells shown faded around this one, or removes them.
+    pub fn set_dungeon_context(&mut self, context: Option<DungeonContext>) {
+        self.dungeon_context = context;
+    }
+
+    /// Selects `dungeon` under "Used in" (or clears the selection) and asks for its cells.
+    pub(super) fn select_used_in(&mut self, dungeon: Option<OpenedItem>) {
+        if self.selected_dungeon != dungeon {
+            self.scroll_to_selected_dungeon = dungeon.is_some();
+            self.selected_dungeon = dungeon.clone();
+            self.context_request = Some(dungeon);
+            if self.selected_dungeon.is_none() {
+                self.dungeon_context = None;
+            }
+        }
+    }
+
+    /// Returns, once, a dungeon the user asked to open from "Used in".
+    pub fn take_open_request(&mut self) -> Option<OpenedItem> {
+        self.open_request.take()
+    }
+
+    /// What the right-click menu of object `index` offers.
+    pub(super) fn object_menu_info(
+        &self,
+        index: usize,
+        resources: &EditorResources<'_>,
+    ) -> Option<ObjectMenuInfo> {
+        let object = self.scene.objects.get(index)?;
+        Some(ObjectMenuInfo {
+            name: panels::object_display_name(object, resources.custom_names, resources.catalog),
+            can_tie: object.can_have_action(),
+            triggered_by: self.scene.objects_triggering(object.id).len(),
+        })
+    }
+
+    /// Carries out the choice made in the right-click menu of object `index`.
+    pub(super) fn apply_object_menu(
+        &mut self,
+        choice: ObjectMenuChoice,
+        index: usize,
+        resources: &EditorResources<'_>,
+    ) {
+        match choice {
+            ObjectMenuChoice::TieAction => self.start_tying(index, resources),
+            ObjectMenuChoice::RemoveActions => self.remove_actions_triggering(index, resources),
+        }
+    }
+
+    /// Starts choosing the object that object `index`'s action triggers.
+    fn start_tying(&mut self, index: usize, resources: &EditorResources<'_>) {
+        if !self.can_edit() {
+            return;
+        }
+        let Some(object) = self.scene.objects.get(index) else { return };
+        self.palette.armed = None;
+        self.viewport.tying_from = Some(object.id);
+        self.selected_object = Some(index);
+        let name = panels::object_display_name(object, resources.custom_names, resources.catalog);
+        self.status_message =
+            format!("Tying the action of {name}: click the object it should trigger (Esc to cancel)");
+    }
+
+    /// Stops choosing an action target without changing anything.
+    fn cancel_tying(&mut self) {
+        if self.viewport.tying_from.take().is_some() {
+            self.status_message = "Tying cancelled".to_string();
+        }
+    }
+
+    /// Makes the action of object `source_id` trigger object `target_index`.
+    fn tie_action(&mut self, source_id: ObjectId, target_index: usize, resources: &EditorResources<'_>) {
+        self.viewport.tying_from = None;
+        let Some(source_index) = self.scene.objects.iter().position(|object| object.id == source_id) else {
+            return;
+        };
+        let Some(target_id) = self.scene.objects.get(target_index).map(|object| object.id) else { return };
+        if source_index == target_index || !self.can_edit() {
+            return;
+        }
+        let object = &mut self.scene.objects[source_index];
+        self.history.record(SceneEdit::Replace { index: source_index, object: object.clone() });
+        object.tie_action_to(target_id);
+        let describe = |index: usize| {
+            panels::object_display_name(&self.scene.objects[index], resources.custom_names, resources.catalog)
+        };
+        self.status_message = format!("{} now triggers {}", describe(source_index), describe(target_index));
+        self.selected_object = Some(source_index);
+    }
+
+    /// Removes the actions of every object that triggers object `index`, as one undo step.
+    fn remove_actions_triggering(&mut self, index: usize, resources: &EditorResources<'_>) {
+        let Some(target_id) = self.scene.objects.get(index).map(|object| object.id) else { return };
+        let sources = self.scene.objects_triggering(target_id);
+        if sources.is_empty() || !self.can_edit() {
+            return;
+        }
+        let reverts = sources
+            .iter()
+            .map(|&source| SceneEdit::Replace { index: source, object: self.scene.objects[source].clone() })
+            .collect();
+        for &source in &sources {
+            self.scene.objects[source].remove_action();
+        }
+        self.history.record(SceneEdit::Group(reverts));
+        let name = panels::object_display_name(
+            &self.scene.objects[index],
+            resources.custom_names,
+            resources.catalog,
+        );
+        self.status_message = format!("Removed {} action(s) that triggered {name}", sources.len());
+    }
+
     /// Whether the room belongs to the project (rather than being a Daggerfall room).
     pub fn is_project_room(&self) -> bool {
         self.project_room_name.is_some()
@@ -208,6 +553,9 @@ impl RoomEditor {
     ///
     /// Call this after any top or bottom bars of the window have been added.
     pub fn show(&mut self, context: &egui::Context, resources: &mut EditorResources<'_>) {
+        self.outside_cell = (0..self.scene.objects.len())
+            .map(|index| self.distance_outside_cell(index, resources.library))
+            .collect();
         self.show_outliner(context, resources);
         self.show_properties(context, resources);
         self.palette.show(context, self.id, resources);
@@ -253,7 +601,9 @@ impl RoomEditor {
         // While an asset is armed for placement, Escape and R act on it instead of the selection.
         let is_placing = self.palette.armed.is_some();
         if shortcut(Modifiers::NONE, Key::Escape) {
-            if is_placing {
+            if self.viewport.tying_from.is_some() {
+                self.cancel_tying();
+            } else if is_placing {
                 self.palette.armed = None;
             } else {
                 self.selected_object = None;
@@ -272,7 +622,8 @@ impl RoomEditor {
 
     /// Adds the Edit menu entries.
     pub fn edit_menu(&mut self, ui: &mut egui::Ui) {
-        let has_selection = self.selected_object.is_some();
+        // Several selected objects can only be moved.
+        let has_selection = self.selected_object.is_some() && !self.has_multiple_selection();
         let menu_button = |ui: &mut egui::Ui, enabled: bool, label: &str, shortcut: &str| {
             let clicked = ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut)).clicked();
             if clicked {
@@ -355,7 +706,7 @@ impl RoomEditor {
         }
     }
 
-    /// Centres the camera on the selected object.
+    /// Centres the camera on the selected object (the last selected, with several).
     fn focus_selection(&mut self, library: &mut Arena2Library) {
         let Some(object) = self.selected_object.and_then(|index| self.scene.objects.get(index)) else {
             return;
@@ -370,8 +721,58 @@ impl RoomEditor {
         self.camera.frame_bounds(center - Vec3::splat(radius), center + Vec3::splat(radius));
     }
 
+    /// Every selected object, the last selected last. Empty if none is.
+    pub(super) fn selected_indices(&self) -> Vec<usize> {
+        let count = self.scene.objects.len();
+        match self.selected_object.filter(|&index| index < count) {
+            Some(primary) if self.selection_set.contains(&primary) => {
+                self.selection_set.iter().copied().filter(|&index| index < count).collect()
+            }
+            Some(primary) => vec![primary],
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether more than one object is selected; then they can only be moved.
+    pub(super) fn has_multiple_selection(&self) -> bool {
+        self.selected_indices().len() > 1
+    }
+
+    /// Selects exactly `indices` (the last one becomes the main selection).
+    pub(super) fn select_objects(&mut self, mut indices: Vec<usize>) {
+        let mut seen = std::collections::HashSet::new();
+        indices.retain(|index| seen.insert(*index));
+        self.selected_object = indices.last().copied();
+        self.selection_set = if indices.len() > 1 { indices } else { Vec::new() };
+    }
+
+    /// Adds object `index` to the selection, or takes it out if it is selected (Shift+click).
+    pub(super) fn toggle_selected(&mut self, index: usize) {
+        let mut indices = self.selected_indices();
+        if let Some(position) = indices.iter().position(|&selected| selected == index) {
+            indices.remove(position);
+        } else {
+            indices.push(index);
+        }
+        self.select_objects(indices);
+    }
+
+    /// Says in the status bar that only moving works with several objects selected,
+    /// and returns `true` if that is the case.
+    fn refuse_for_multiple_selection(&mut self, action: &str) -> bool {
+        let count = self.selected_indices().len();
+        if count > 1 {
+            self.status_message =
+                format!("Cannot {action} {count} objects at once; several objects can only be moved");
+        }
+        count > 1
+    }
+
     /// Removes the selected object.
     fn delete_selection(&mut self) {
+        if self.refuse_for_multiple_selection("delete") {
+            return;
+        }
         let Some(index) = self.selected_object.filter(|&index| index < self.scene.objects.len()) else {
             return;
         };
@@ -386,6 +787,9 @@ impl RoomEditor {
 
     /// Copies the selected object and selects the copy.
     fn duplicate_selection(&mut self) {
+        if self.refuse_for_multiple_selection("duplicate") {
+            return;
+        }
         if self.selected_object.is_none_or(|index| index >= self.scene.objects.len()) || !self.can_edit() {
             return;
         }
@@ -394,6 +798,7 @@ impl RoomEditor {
         };
         let mut copy = original.clone();
         copy.position += DUPLICATE_OFFSET;
+        copy.id = self.scene.new_object_id();
         let copy_index = self.scene.objects.len();
         self.status_message = format!("Duplicated {}", copy.name);
         self.scene.objects.push(copy);
@@ -403,6 +808,9 @@ impl RoomEditor {
 
     /// Turns the selected object around the vertical axis by `degrees`.
     fn rotate_selection(&mut self, degrees: f32) {
+        if self.refuse_for_multiple_selection("rotate") {
+            return;
+        }
         let Some(index) = self.selected_object.filter(|&index| index < self.scene.objects.len()) else {
             return;
         };
@@ -436,7 +844,28 @@ impl RoomEditor {
         if self.selected_object.is_some_and(|index| index >= self.scene.objects.len()) {
             self.selected_object = None;
         }
+        let count = self.scene.objects.len();
+        self.selection_set.retain(|&index| index < count);
     }
+}
+
+/// How far `object` reaches outside its cell's square, using its model's box.
+pub(super) fn object_distance_outside_cell(object: &SceneObject, library: &mut Arena2Library) -> f32 {
+    let bounds = match object.kind {
+        SceneObjectKind::Model { model_id, .. } => {
+            library.model(model_id).map(|mesh| (mesh.bounds_min, mesh.bounds_max))
+        }
+        _ => None,
+    };
+    object.distance_outside_cell(bounds)
+}
+
+/// Tells the user how far an object reaches outside the cell's square.
+pub(super) fn outside_cell_warning(distance: f32) -> String {
+    format!(
+        "⚠ Reaches {distance:.2} m outside the cell's {RDB_BLOCK_SIDE} m square, so in a dungeon \
+         it can overlap the next cell"
+    )
 }
 
 /// Draws a drop-down choosing the grid lock snap step from [`SNAP_STEPS`].
@@ -462,4 +891,6 @@ pub fn view_settings_menu(ui: &mut egui::Ui, settings: &mut ViewSettings) {
     ui.checkbox(&mut settings.show_flats, "Flats");
     ui.checkbox(&mut settings.show_markers, "Editor markers");
     ui.checkbox(&mut settings.show_lights, "Lights");
+    ui.checkbox(&mut settings.show_action_links, "Action links")
+        .on_hover_text("Red lines from each object to the object its action triggers");
 }

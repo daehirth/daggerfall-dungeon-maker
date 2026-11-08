@@ -44,6 +44,13 @@ const BACKGROUND_COLOR: wgpu::Color = wgpu::Color { r: 0.035, g: 0.04, b: 0.05, 
 const SELECTION_HIGHLIGHT: [f32; 4] = [1.0, 0.55, 0.1, 0.35];
 /// Highlight applied to the object under the mouse.
 const HOVER_HIGHLIGHT: [f32; 4] = [0.4, 0.7, 1.0, 0.18];
+/// Tint of the surrounding cells shown around a cell for context: mostly the
+/// background colour, so they look faded.
+const CONTEXT_FADE: [f32; 4] = [0.035, 0.04, 0.05, 0.7];
+/// Highlight applied to objects inside a selection box being dragged.
+const BOX_SELECTION_HIGHLIGHT: [f32; 4] = [0.4, 0.7, 1.0, 0.45];
+/// Outline colour of models inside a selection box being dragged.
+const BOX_SELECTION_LINE_COLOR: Vec4 = Vec4::new(0.45, 0.7, 1.0, 1.0);
 /// Highlight applied to every object of the room under the mouse in the dungeon view.
 const ROOM_HIGHLIGHT: [f32; 4] = [0.35, 0.7, 1.0, 0.3];
 /// Highlight applied to the ghost preview of an object about to be placed.
@@ -69,6 +76,8 @@ pub struct ViewSettings {
     pub show_flats: bool,
     pub show_markers: bool,
     pub show_lights: bool,
+    /// Lines from each object to the object its action triggers.
+    pub show_action_links: bool,
 }
 
 impl Default for ViewSettings {
@@ -81,6 +90,7 @@ impl Default for ViewSettings {
             show_flats: true,
             show_markers: true,
             show_lights: true,
+            show_action_links: true,
         }
     }
 }
@@ -94,16 +104,32 @@ pub struct RoomOutline {
     pub highlighted: bool,
 }
 
+impl FrameRequest<'_> {
+    /// Whether object `index` is drawn as selected.
+    fn is_selected(&self, index: usize) -> bool {
+        self.selected_object == Some(index) || self.selected_objects.contains(&index)
+    }
+}
+
 /// Everything needed to draw one frame of a viewport.
 pub struct FrameRequest<'frame> {
     pub scene: Option<&'frame Scene>,
     pub camera: &'frame OrbitCamera,
     pub selected_object: Option<usize>,
     pub hovered_object: Option<usize>,
+    /// More objects drawn as selected, when several are.
+    pub selected_objects: &'frame [usize],
+    /// More objects drawn as hovered, such as those inside a selection box.
+    pub hovered_objects: &'frame [usize],
     /// Every object whose group index matches is highlighted (used for whole rooms in the dungeon view).
     pub highlighted_group: Option<usize>,
     /// Object being placed from the asset palette, drawn as a ghost.
     pub placement_preview: Option<&'frame SceneObject>,
+    /// Water surfaces to draw, each the corner of a cell's square at its water height.
+    pub water_planes: &'frame [Vec3],
+    /// Objects drawn faded for context only, such as the cells around the edited
+    /// one in a dungeon. They are never highlighted or picked.
+    pub context_scene: Option<&'frame Scene>,
     /// Block footprints to outline; the grid is sized to cover them.
     pub room_outlines: &'frame [RoomOutline],
     pub settings: &'frame ViewSettings,
@@ -249,12 +275,17 @@ pub struct SceneRenderer {
     model_pipeline_double_sided: wgpu::RenderPipeline,
     billboard_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    /// Draws lines over everything, for action links that would otherwise be hidden in walls.
+    overlay_line_pipeline: wgpu::RenderPipeline,
+    /// See-through triangles for water surfaces.
+    water_pipeline: wgpu::RenderPipeline,
     fallback_texture: Rc<GpuTexture>,
     textures: HashMap<TextureKey, Rc<GpuTexture>>,
     models: HashMap<u32, Option<GpuModel>>,
     model_instance_buffer: GrowableBuffer,
     billboard_instance_buffer: GrowableBuffer,
     line_vertex_buffer: GrowableBuffer,
+    water_vertex_buffer: GrowableBuffer,
     /// Rendered previews of models for the asset palette.
     thumbnails: ThumbnailCache,
 }
@@ -327,6 +358,21 @@ impl SceneRenderer {
             topology: wgpu::PrimitiveTopology::TriangleList,
             cull_mode: None,
             depth_write: true,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            blend: None,
+        });
+        // Water: see-through triangles, hidden behind walls but not hiding what is behind them.
+        let water_pipeline = pipeline_builder.build(PipelineSpec {
+            label: "water pipeline",
+            layout: &line_layout,
+            vertex_entry: "vs_line",
+            fragment_entry: "fs_line",
+            buffers: &[LineVertex::layout()],
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            depth_write: false,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
         });
         let line_pipeline = pipeline_builder.build(PipelineSpec {
             label: "line pipeline",
@@ -337,6 +383,20 @@ impl SceneRenderer {
             topology: wgpu::PrimitiveTopology::LineList,
             cull_mode: None,
             depth_write: false,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            blend: None,
+        });
+        let overlay_line_pipeline = pipeline_builder.build(PipelineSpec {
+            label: "overlay line pipeline",
+            layout: &line_layout,
+            vertex_entry: "vs_line",
+            fragment_entry: "fs_line",
+            buffers: &[LineVertex::layout()],
+            topology: wgpu::PrimitiveTopology::LineList,
+            cull_mode: None,
+            depth_write: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            blend: None,
         });
 
         let fallback_texture = Rc::new(resources::upload_texture(
@@ -360,6 +420,8 @@ impl SceneRenderer {
             model_pipeline_double_sided,
             billboard_pipeline,
             line_pipeline,
+            overlay_line_pipeline,
+            water_pipeline,
             fallback_texture,
             textures: HashMap::new(),
             models: HashMap::new(),
@@ -370,6 +432,7 @@ impl SceneRenderer {
                 wgpu::BufferUsages::VERTEX,
             ),
             line_vertex_buffer: GrowableBuffer::new(device, "line vertices", wgpu::BufferUsages::VERTEX),
+            water_vertex_buffer: GrowableBuffer::new(device, "water vertices", wgpu::BufferUsages::VERTEX),
             thumbnails,
         }
     }
@@ -409,6 +472,8 @@ impl SceneRenderer {
 
         let lines = build_helper_lines(library, request);
         self.line_vertex_buffer.write(device, queue, bytemuck::cast_slice(&lines.vertices));
+        let water = water_vertices(request.water_planes);
+        self.water_vertex_buffer.write(device, queue, bytemuck::cast_slice(&water));
 
         let mut encoder = device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport encoder") });
@@ -465,11 +530,27 @@ impl SceneRenderer {
                 pass.draw(0..6, batch.instances.clone());
             }
 
-            // Helper lines.
+            // Helper lines, then action links on top of everything.
+            let overlay_start = lines.overlay_start.unwrap_or(lines.vertices.len()) as u32;
             if !lines.vertices.is_empty() {
-                pass.set_pipeline(&self.line_pipeline);
                 pass.set_vertex_buffer(0, self.line_vertex_buffer.buffer().slice(..));
-                pass.draw(0..lines.vertices.len() as u32, 0..1);
+            }
+            if overlay_start > 0 {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.draw(0..overlay_start, 0..1);
+            }
+            // Water, see-through, after everything solid.
+            if !water.is_empty() {
+                pass.set_pipeline(&self.water_pipeline);
+                pass.set_vertex_buffer(0, self.water_vertex_buffer.buffer().slice(..));
+                pass.draw(0..water.len() as u32, 0..1);
+                if (overlay_start as usize) < lines.vertices.len() {
+                    pass.set_vertex_buffer(0, self.line_vertex_buffer.buffer().slice(..));
+                }
+            }
+            if (overlay_start as usize) < lines.vertices.len() {
+                pass.set_pipeline(&self.overlay_line_pipeline);
+                pass.draw(overlay_start..lines.vertices.len() as u32, 0..1);
             }
         }
         queue.submit(Some(encoder.finish()));
@@ -486,10 +567,12 @@ impl SceneRenderer {
     ) -> (Vec<ModelBatch>, Vec<BillboardBatch>) {
         let settings = request.settings;
         let highlight_for = |index: usize, object: &SceneObject| {
-            if request.selected_object == Some(index) {
+            if request.is_selected(index) {
                 SELECTION_HIGHLIGHT
             } else if request.highlighted_group == Some(object.group_index) {
                 ROOM_HIGHLIGHT
+            } else if request.hovered_objects.contains(&index) {
+                BOX_SELECTION_HIGHLIGHT
             } else if request.hovered_object == Some(index) {
                 HOVER_HIGHLIGHT
             } else {
@@ -508,7 +591,15 @@ impl SceneRenderer {
             .enumerate()
             .filter(|(_, object)| object.visible)
             .map(|(index, object)| (object, highlight_for(index, object)))
-            .chain(request.placement_preview.map(|object| (object, PLACEMENT_PREVIEW_HIGHLIGHT)));
+            .chain(request.placement_preview.map(|object| (object, PLACEMENT_PREVIEW_HIGHLIGHT)))
+            .chain(
+                request
+                    .context_scene
+                    .map_or(&[][..], |scene| scene.objects.as_slice())
+                    .iter()
+                    .filter(|object| object.visible && !object.is_marker())
+                    .map(|object| (object, CONTEXT_FADE)),
+            );
 
         for (object, highlight) in drawable_objects {
             match object.kind {
@@ -639,7 +730,7 @@ fn build_helper_lines(library: &mut Arena2Library, request: &FrameRequest<'_>) -
         }
     }
 
-    if let Some(SceneObject { kind: SceneObjectKind::Light { radius }, position, .. }) =
+    if let Some(SceneObject { kind: SceneObjectKind::Light { radius, .. }, position, .. }) =
         request.placement_preview
     {
         for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
@@ -655,11 +746,11 @@ fn build_helper_lines(library: &mut Arena2Library, request: &FrameRequest<'_>) -
 
     if settings.show_lights {
         for (index, object) in scene.objects.iter().enumerate() {
-            let SceneObjectKind::Light { radius } = object.kind else { continue };
+            let SceneObjectKind::Light { radius, .. } = object.kind else { continue };
             if !object.visible {
                 continue;
             }
-            let selected = request.selected_object == Some(index);
+            let selected = request.is_selected(index);
             let color = if selected { Vec4::new(1.0, 0.6, 0.1, 1.0) } else { Vec4::new(1.0, 0.9, 0.35, 1.0) };
             let center = object.position;
             let size = LIGHT_PICK_RADIUS;
@@ -674,19 +765,101 @@ fn build_helper_lines(library: &mut Arena2Library, request: &FrameRequest<'_>) -
         }
     }
 
-    // Bounding box around the selected model.
-    if let Some(object) = request.selected_object.and_then(|index| scene.objects.get(index)) {
+    for &corner in request.water_planes {
+        let side = RDB_BLOCK_SIDE;
+        let corners =
+            [Vec3::ZERO, Vec3::new(side, 0.0, 0.0), Vec3::new(side, 0.0, side), Vec3::new(0.0, 0.0, side)];
+        for (start, end) in corners.iter().zip(corners.iter().cycle().skip(1)) {
+            lines.add_line(corner + *start, corner + *end, WATER_EDGE_COLOR);
+        }
+    }
+
+    if settings.show_action_links {
+        add_action_links(&mut lines, library, scene);
+    }
+
+    // Bounding box around each selected model, and each model inside a selection box.
+    let selected = request.selected_object.into_iter().chain(request.selected_objects.iter().copied());
+    let outlined = selected
+        .map(|index| (index, Vec4::new(1.0, 0.55, 0.1, 1.0)))
+        .chain(request.hovered_objects.iter().map(|&index| (index, BOX_SELECTION_LINE_COLOR)));
+    for (object, color) in outlined.filter_map(|(index, color)| Some((scene.objects.get(index)?, color))) {
         if let SceneObjectKind::Model { model_id, .. } = object.kind {
             if let Some(mesh) = library.model(model_id) {
                 let matrix = object.model_matrix();
                 let corners = box_corners(mesh.bounds_min, mesh.bounds_max)
                     .map(|corner| matrix.transform_point3(corner));
-                lines.add_box(&corners, Vec4::new(1.0, 0.55, 0.1, 1.0));
+                lines.add_box(&corners, color);
             }
         }
     }
 
     lines
+}
+
+/// Colour of water surfaces: blue, mostly see-through.
+const WATER_COLOR: [f32; 4] = [0.2, 0.5, 1.0, 0.28];
+/// Colour of the edge of a water surface.
+const WATER_EDGE_COLOR: Vec4 = Vec4::new(0.35, 0.65, 1.0, 1.0);
+
+/// Two triangles for each water surface, covering a cell's square at water height.
+fn water_vertices(planes: &[Vec3]) -> Vec<LineVertex> {
+    planes
+        .iter()
+        .flat_map(|&corner| {
+            let at = |x: f32, z: f32| LineVertex {
+                position: (corner + Vec3::new(x, 0.0, z)).to_array(),
+                color: WATER_COLOR,
+            };
+            let side = RDB_BLOCK_SIDE;
+            [at(0.0, 0.0), at(side, 0.0), at(side, side), at(0.0, 0.0), at(side, side), at(0.0, side)]
+        })
+        .collect()
+}
+
+/// Colour of the lines linking an object to the one its action triggers.
+const ACTION_LINK_COLOR: Vec4 = Vec4::new(1.0, 0.2, 0.2, 1.0);
+
+/// Adds a red line, drawn over everything, from each visible object to the
+/// visible object its action triggers, with an arrowhead at the target.
+fn add_action_links(lines: &mut LineBatch, library: &mut Arena2Library, scene: &Scene) {
+    lines.overlay_start.get_or_insert(lines.vertices.len());
+    for object in scene.objects.iter().filter(|object| object.visible) {
+        let Some(target) =
+            object.next.and_then(|next| scene.object_by_id(next)).filter(|target| target.visible)
+        else {
+            continue;
+        };
+        let start = object_center(library, object);
+        let end = object_center(library, target);
+        let offset = end - start;
+        let length = offset.length();
+        if length < 1e-3 {
+            continue;
+        }
+        lines.add_line(start, end, ACTION_LINK_COLOR);
+
+        // Arrowhead: four short strokes back from the target, so it reads from any angle.
+        let direction = offset / length;
+        let side = direction.cross(Vec3::Y).try_normalize().unwrap_or(Vec3::X);
+        let up = side.cross(direction);
+        let head = (length * 0.2).min(0.5);
+        let back = end - direction * head;
+        for spread in [side, -side, up, -up] {
+            lines.add_line(end, back + spread * head * 0.45, ACTION_LINK_COLOR);
+        }
+    }
+}
+
+/// Middle of an object: the centre of a model's bounding box, or the position of anything else.
+fn object_center(library: &mut Arena2Library, object: &SceneObject) -> Vec3 {
+    match object.kind {
+        SceneObjectKind::Model { model_id, .. } => match library.model(model_id) {
+            Some(mesh) => object.model_matrix().transform_point3((mesh.bounds_min + mesh.bounds_max) * 0.5),
+            None => object.position,
+        },
+        _ => object.position,
+    }
 }
 
 /// Adds a floor grid that covers every room outline (or one block at the origin) plus a margin.
@@ -787,6 +960,9 @@ struct PipelineSpec<'spec> {
     topology: wgpu::PrimitiveTopology,
     cull_mode: Option<wgpu::Face>,
     depth_write: bool,
+    depth_compare: wgpu::CompareFunction,
+    /// How the output mixes with what is already drawn; `None` replaces it.
+    blend: Option<wgpu::BlendState>,
 }
 
 /// The model pipeline description shared by the culled and double sided variants.
@@ -803,6 +979,8 @@ fn model_pipeline_spec<'spec>(
         topology: wgpu::PrimitiveTopology::TriangleList,
         cull_mode: Some(wgpu::Face::Back),
         depth_write: true,
+        depth_compare: wgpu::CompareFunction::LessEqual,
+        blend: None,
     }
 }
 
@@ -829,7 +1007,7 @@ impl PipelineBuilder<'_> {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: COLOR_FORMAT,
-                    blend: None,
+                    blend: spec.blend,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -843,7 +1021,7 @@ impl PipelineBuilder<'_> {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: spec.depth_write,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_compare: spec.depth_compare,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),

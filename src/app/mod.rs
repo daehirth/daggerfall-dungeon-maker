@@ -18,24 +18,26 @@ mod room_browser;
 mod room_editor;
 mod viewport_tools;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use eframe::{egui, egui_wgpu};
+use glam::Vec3;
 
-use crate::arena2::Arena2Library;
+use crate::arena2::{Arena2Library, RDB_BLOCK_SIDE};
 use crate::catalog::AssetCatalog;
 use crate::custom_names::CustomNames;
 use crate::project::{
     ItemId, Project, ProjectDungeon, ProjectDungeonRoom, ProjectEntry, ProjectRoom, PROJECT_FILE_EXTENSION,
 };
-use crate::render::SceneRenderer;
+use crate::render::{RoomOutline, SceneRenderer};
 use crate::scene::Scene;
 use arena2_prompt::Arena2Prompt;
 use dungeon_browser::DungeonBrowser;
 use dungeon_view::{DungeonDetails, DungeonPropertiesAction, DungeonView};
 use project_panel::{OpenedItem, PanelAction, ProjectPanel};
 use room_browser::RoomBrowser;
-use room_editor::RoomEditor;
+use room_editor::{ContextCell, DungeonContext, RoomEditor, UsedInEntry};
 use viewport_tools::EditorResources;
 
 /// Storage key under which the chosen ARENA2 folder is remembered between runs.
@@ -44,6 +46,8 @@ const ARENA2_FOLDER_STORAGE_KEY: &str = "arena2_folder";
 const CUSTOM_NAMES_STORAGE_KEY: &str = "custom_names";
 /// Storage key under which the last project file is remembered, to reopen it on the next run.
 const PROJECT_FILE_STORAGE_KEY: &str = "project_file";
+/// How long the pointer must rest on something before its explanation appears.
+const TOOLTIP_DELAY_SECONDS: f32 = 0.5;
 /// Name shown in window titles.
 const APPLICATION_NAME: &str = "Daggerfall Dungeon Maker";
 /// Name of a project that has not been saved yet.
@@ -131,6 +135,8 @@ pub struct DungeonMakerApp {
     renderer: Option<SceneRenderer>,
     /// Placeable assets, built from the game data when it is loaded.
     catalog: AssetCatalog,
+    /// For each Daggerfall cell, the indices of the Daggerfall dungeons that use it.
+    cell_usage: HashMap<String, Vec<usize>>,
     /// The user's own names for rooms and models, saved with the settings.
     custom_names: CustomNames,
     /// The user's own rooms and dungeons.
@@ -171,6 +177,8 @@ impl DungeonMakerApp {
     /// valid the user is asked to choose one. The project given on the command
     /// line, or else the one open last time, is reopened.
     pub fn new(creation_context: &eframe::CreationContext<'_>, startup_options: StartupOptions) -> Self {
+        // Property explanations appear after the pointer has rested on them for half a second.
+        creation_context.egui_ctx.style_mut(|style| style.interaction.tooltip_delay = TOOLTIP_DELAY_SECONDS);
         let render_state = creation_context.wgpu_render_state.clone();
         let renderer = render_state.as_ref().map(SceneRenderer::new);
         let stored_string = |key: &str| creation_context.storage.and_then(|storage| storage.get_string(key));
@@ -193,6 +201,7 @@ impl DungeonMakerApp {
             render_state,
             renderer,
             catalog: AssetCatalog::default(),
+            cell_usage: HashMap::new(),
             custom_names,
             project,
             project_path: None,
@@ -243,7 +252,17 @@ impl DungeonMakerApp {
                 self.close_everything();
                 let room_names = library.rdb_block_names();
                 self.room_browser.set_room_names(room_names.clone());
-                self.project_panel.set_daggerfall_contents(room_names, library.dungeons());
+                let dungeons = library.dungeons();
+                self.cell_usage.clear();
+                for (index, dungeon) in dungeons.iter().enumerate() {
+                    for block in &dungeon.blocks {
+                        let users = self.cell_usage.entry(block.block_name.clone()).or_default();
+                        if users.last() != Some(&index) {
+                            users.push(index);
+                        }
+                    }
+                }
+                self.project_panel.set_daggerfall_contents(room_names, dungeons);
                 self.catalog = AssetCatalog::build(&mut library);
                 self.status_message = format!("Loaded game data from {}", folder.display());
                 self.library = Some(library);
@@ -394,6 +413,11 @@ impl DungeonMakerApp {
         // Daggerfall's own rooms stay read-only, even in a project dungeon.
         editor.set_read_only(room.project_room.is_none());
         editor.set_dungeon_type(view.dungeon_type);
+        // The dungeon it was opened from is selected under "Used in", so its
+        // other cells show faded around this one.
+        if let Some(dungeon) = self.opened_item.clone() {
+            editor.select_used_in(Some(dungeon));
+        }
         self.status_message = format!("Opened {} in a new window", room.block_name);
         self.room_windows.push(RoomWindow {
             viewport_id: egui::ViewportId::from_hash_of(("room_window", window_number)),
@@ -462,6 +486,198 @@ impl DungeonMakerApp {
             }
             Workspace::Empty => {}
         }
+    }
+
+    /// The dungeons that use a cell: those using the project cell `project_room`,
+    /// or, for a Daggerfall cell, the Daggerfall dungeons and project dungeons
+    /// that use the original `block_name`. Project dungeons come first.
+    fn used_in(&mut self, block_name: &str, project_room: Option<ItemId>) -> Vec<UsedInEntry> {
+        let mut entries: Vec<UsedInEntry> = self
+            .project
+            .dungeons()
+            .into_iter()
+            .filter(|dungeon| {
+                dungeon.rooms.iter().any(|placement| match project_room {
+                    Some(room_id) => placement.room == Some(room_id),
+                    None => placement.room.is_none() && placement.block_name == block_name,
+                })
+            })
+            .map(|dungeon| UsedInEntry {
+                label: format!("{} · your dungeon", dungeon.name),
+                item: OpenedItem::Project(dungeon.id),
+            })
+            .collect();
+        if project_room.is_none() {
+            if let (Some(library), Some(users)) = (self.library.as_mut(), self.cell_usage.get(block_name)) {
+                let dungeons = library.dungeons();
+                entries.extend(users.iter().filter_map(|&index| {
+                    let dungeon = dungeons.get(index)?;
+                    Some(UsedInEntry {
+                        label: format!("{} · {}", dungeon.name, dungeon.region_name),
+                        item: OpenedItem::DaggerfallDungeon(index),
+                    })
+                }));
+            }
+        }
+        entries
+    }
+
+    /// The cells of `dungeon` around this cell, positioned relative to it, for
+    /// showing faded around the cell. The cell is found as in [`Self::used_in`];
+    /// `layout_index` picks its place when the cell appears more than once and
+    /// `dungeon` is the dungeon open in the main window.
+    fn dungeon_context(
+        &mut self,
+        dungeon: &OpenedItem,
+        block_name: &str,
+        project_room: Option<ItemId>,
+        layout_index: Option<usize>,
+    ) -> Option<DungeonContext> {
+        let library = self.library.as_mut()?;
+        let layout = match dungeon {
+            OpenedItem::DaggerfallDungeon(index) => {
+                ProjectDungeonRoom::layout_of(library.dungeons().get(*index)?)
+            }
+            OpenedItem::Project(id) => self.project.dungeon(*id)?.rooms.clone(),
+            OpenedItem::DaggerfallRoom(_) => return None,
+        };
+        let is_this_cell = |placement: &ProjectDungeonRoom| match project_room {
+            Some(room_id) => placement.room == Some(room_id),
+            None => placement.room.is_none() && placement.block_name == block_name,
+        };
+        let preferred = layout_index.filter(|&index| layout.get(index).is_some_and(is_this_cell));
+        let here_index = preferred.or_else(|| layout.iter().position(is_this_cell))?;
+        let here = &layout[here_index];
+
+        let mut objects = Vec::new();
+        let mut outlines = vec![RoomOutline { origin: Vec3::ZERO, highlighted: false }];
+        let mut cells = Vec::new();
+        for (index, placement) in layout.iter().enumerate() {
+            if index == here_index {
+                continue;
+            }
+            let offset = Vec3::new(
+                (placement.grid_x - here.grid_x) as f32 * RDB_BLOCK_SIDE,
+                0.0,
+                (placement.grid_z - here.grid_z) as f32 * RDB_BLOCK_SIDE,
+            );
+            let Ok((scene, _)) = dungeon_view::load_room_scene(placement, &self.project, library) else {
+                continue;
+            };
+            let cell_index = cells.len();
+            objects.extend(scene.objects.into_iter().map(|mut object| {
+                object.position += offset;
+                object.group_index = cell_index;
+                object
+            }));
+            outlines.push(RoomOutline { origin: offset, highlighted: false });
+            let label = match placement.room.and_then(|room_id| self.project.room(room_id)) {
+                Some(room) => format!("{} (your cell)", room.name),
+                None => placement.block_name.clone(),
+            };
+            cells.push(ContextCell { label, layout_index: index });
+        }
+        Some(DungeonContext {
+            dungeon: dungeon.clone(),
+            scene: Scene { block_name: String::new(), objects },
+            outlines,
+            cells,
+        })
+    }
+
+    /// The rooms of `dungeon`, in layout order.
+    fn dungeon_layout(&mut self, dungeon: &OpenedItem) -> Option<Vec<ProjectDungeonRoom>> {
+        match dungeon {
+            OpenedItem::DaggerfallDungeon(index) => {
+                Some(ProjectDungeonRoom::layout_of(self.library.as_mut()?.dungeons().get(*index)?))
+            }
+            OpenedItem::Project(id) => Some(self.project.dungeon(*id)?.rooms.clone()),
+            OpenedItem::DaggerfallRoom(_) => None,
+        }
+    }
+
+    /// Opens the cell at `layout_index` in `dungeon`, double-clicked among the
+    /// faded cells around another one, keeping `dungeon` around it.
+    ///
+    /// From a cell window of the dungeon open in the main window, the cell opens
+    /// in a cell window the same way; otherwise it opens in the main window.
+    fn open_context_cell(
+        &mut self,
+        context: &egui::Context,
+        dungeon: OpenedItem,
+        layout_index: usize,
+        from_window: bool,
+    ) {
+        if from_window && self.opened_item.as_ref() == Some(&dungeon) {
+            if let Workspace::Dungeon(view) = &self.workspace {
+                let room_index = (0..)
+                    .map_while(|index| view.room(index).map(|_| index))
+                    .find(|&index| view.layout_index(index) == Some(layout_index));
+                if let Some(room_index) = room_index {
+                    self.open_room_window(context, room_index);
+                    return;
+                }
+            }
+        }
+        let Some(placement) =
+            self.dungeon_layout(&dungeon).and_then(|layout| layout.get(layout_index).cloned())
+        else {
+            return;
+        };
+        match placement.room {
+            Some(room_id) => self.open_project_item(room_id),
+            None => self.open_room(&placement.block_name),
+        }
+        if let Workspace::Room(editor) = &mut self.workspace {
+            editor.set_home_placement(dungeon.clone(), layout_index);
+            editor.select_used_in(Some(dungeon));
+        }
+    }
+
+    /// The cell open in the main window: its block name and project room.
+    fn main_cell(&self) -> Option<(String, Option<ItemId>)> {
+        match self.opened_item.clone()? {
+            OpenedItem::DaggerfallRoom(block_name) => Some((block_name, None)),
+            OpenedItem::Project(id) if matches!(self.workspace, Workspace::Room(_)) => {
+                let block_name =
+                    self.project.room(id).and_then(|room| room.based_on.clone()).unwrap_or_default();
+                Some((block_name, Some(id)))
+            }
+            _ => None,
+        }
+    }
+
+    /// "Used in" list for the cell open in the main window.
+    fn main_used_in(&mut self) -> Vec<UsedInEntry> {
+        match self.opened_item.clone() {
+            Some(OpenedItem::DaggerfallRoom(block_name)) => self.used_in(&block_name, None),
+            Some(OpenedItem::Project(id)) if matches!(self.workspace, Workspace::Room(_)) => {
+                let block_name =
+                    self.project.room(id).and_then(|room| room.based_on.clone()).unwrap_or_default();
+                self.used_in(&block_name, Some(id))
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// "Used in" lists for each room window, in window order.
+    fn room_window_used_in(&mut self) -> Vec<Vec<UsedInEntry>> {
+        let cells: Vec<Option<(String, Option<ItemId>)>> = self
+            .room_windows
+            .iter()
+            .map(|window| {
+                let Workspace::Dungeon(view) = &self.workspace else { return None };
+                let room = window.dungeon_room_index.and_then(|index| view.room(index))?;
+                Some((room.block_name.clone(), room.project_room))
+            })
+            .collect();
+        cells
+            .into_iter()
+            .map(|cell| match cell {
+                Some((block_name, project_room)) => self.used_in(&block_name, project_room),
+                None => Vec::new(),
+            })
+            .collect()
     }
 
     /// Shows the project's current names in the open workspace and room windows.
@@ -940,6 +1156,10 @@ impl DungeonMakerApp {
 
     /// Draws the main window's workspace.
     fn show_workspace(&mut self, context: &egui::Context) {
+        let mut main_used_in = self.main_used_in();
+        let mut open_request = None;
+        let mut context_request = None;
+        let mut cell_open_request = None;
         let Some(library) = self.library.as_mut() else {
             show_centered_hint(context, "Choose your ARENA2 folder to begin.");
             return;
@@ -956,7 +1176,15 @@ impl DungeonMakerApp {
         let mut properties_action = None;
         match &mut self.workspace {
             Workspace::Room(editor) => {
+                editor.set_used_in(std::mem::take(&mut main_used_in));
                 editor.show(context, &mut resources);
+                open_request = editor.take_open_request();
+                context_request =
+                    editor.take_context_request().map(|dungeon| {
+                        let home = dungeon.as_ref().and_then(|dungeon| editor.home_layout_index(dungeon));
+                        (dungeon, home)
+                    });
+                cell_open_request = editor.take_cell_open_request();
                 if editor.take_blocked_edit() && self.copy_prompt.is_none() {
                     self.copy_prompt = Some(CopyPrompt { subject: CopySubject::Room, viewport: None });
                 }
@@ -976,10 +1204,13 @@ impl DungeonMakerApp {
                 egui::CentralPanel::default().frame(egui::Frame::none()).show(context, |ui| {
                     room_to_open = view.show(ui, &mut resources);
                 });
+                if let Some(room_index) = view.take_make_start_request() {
+                    properties_action = Some(DungeonPropertiesAction::MakeStart(room_index));
+                }
             }
             Workspace::Empty => show_centered_hint(
                 context,
-                "Double-click a cell or dungeon in the project panel, or use File > Open cell… / Open dungeon…",
+                "Click a dungeon or double-click a cell in the project panel, or use File > Open cell… / Open dungeon…",
             ),
         }
         if let Some(room_index) = room_to_open {
@@ -987,6 +1218,24 @@ impl DungeonMakerApp {
         }
         if let Some(action) = properties_action {
             self.handle_dungeon_properties_action(context, action);
+        }
+        // Load the surrounding cells of a dungeon newly selected under "Used in".
+        if let Some((dungeon, home)) = context_request {
+            let context = match (dungeon, self.main_cell()) {
+                (Some(dungeon), Some((block_name, project_room))) => {
+                    self.dungeon_context(&dungeon, &block_name, project_room, home)
+                }
+                _ => None,
+            };
+            if let Workspace::Room(editor) = &mut self.workspace {
+                editor.set_dungeon_context(context);
+            }
+        }
+        if let Some((dungeon, layout_index)) = cell_open_request {
+            self.open_context_cell(context, dungeon, layout_index, false);
+        }
+        if let Some(item) = open_request {
+            self.open_item(&item);
         }
     }
 
@@ -1003,6 +1252,10 @@ impl DungeonMakerApp {
                 self.status_message = format!("{} is now a {}", dungeon.name, dungeon_type.name());
             }
             (DungeonPropertiesAction::OpenRoom(room_index), _) => self.open_room_window(context, room_index),
+            (DungeonPropertiesAction::MakeStart(room_index), Some(_)) => self.make_start_room(room_index),
+            (DungeonPropertiesAction::MakeStart(_), None) if self.copy_prompt.is_none() => {
+                self.copy_prompt = Some(CopyPrompt { subject: CopySubject::Dungeon, viewport: None });
+            }
             (DungeonPropertiesAction::EditBlocked, _) if self.copy_prompt.is_none() => {
                 self.copy_prompt = Some(CopyPrompt { subject: CopySubject::Dungeon, viewport: None });
             }
@@ -1010,8 +1263,39 @@ impl DungeonMakerApp {
         }
     }
 
+    /// Makes room `room_index` of the open project dungeon its starting cell,
+    /// in the project and in the view; whichever cell was the start stops being it.
+    fn make_start_room(&mut self, room_index: usize) {
+        let Some(OpenedItem::Project(id)) = self.opened_item else { return };
+        let Workspace::Dungeon(view) = &mut self.workspace else { return };
+        let Some(layout_index) = view.layout_index(room_index) else { return };
+        if let Some(problems) = view.room(room_index).map(|room| room.start_problems()) {
+            if !problems.is_empty() {
+                self.status_message = format!("{}, so it cannot be the start", problems.join(" and "));
+                return;
+            }
+        }
+        let Some(dungeon) = self.project.dungeon_mut(id) else { return };
+        for (index, placement) in dungeon.rooms.iter_mut().enumerate() {
+            placement.is_starting_block = index == layout_index;
+        }
+        let block_name = dungeon.rooms.get(layout_index).map(|placement| placement.block_name.clone());
+        // Cell windows hold their cell's objects and copy them back every frame,
+        // which would undo the change of exit doors, so they are closed.
+        self.close_room_windows();
+        let (Workspace::Dungeon(view), Some(library)) = (&mut self.workspace, self.library.as_mut()) else {
+            return;
+        };
+        view.set_start_room(room_index, library);
+        self.status_message = format!("{} is now the start cell", block_name.unwrap_or_default());
+    }
+
     /// Draws every room editor window and syncs their edits back into the dungeon view.
     fn show_room_windows(&mut self, context: &egui::Context) {
+        let window_used_in = self.room_window_used_in();
+        let mut open_request = None;
+        let mut context_requests = Vec::new();
+        let mut cell_open_request = None;
         let Some(library) = self.library.as_mut() else { return };
         let mut resources = EditorResources {
             library,
@@ -1023,7 +1307,8 @@ impl DungeonMakerApp {
 
         let prompt = self.copy_prompt;
         let mut copy_choice = None;
-        for window in &mut self.room_windows {
+        for (window, used_in) in self.room_windows.iter_mut().zip(window_used_in) {
+            window.editor.set_used_in(used_in);
             // egui compares the builder with the previous frame's, so a renamed room updates the title.
             let builder = egui::ViewportBuilder::default()
                 .with_title(editor_window_title(&window.editor, resources.custom_names))
@@ -1035,6 +1320,15 @@ impl DungeonMakerApp {
                 }
             });
 
+            if let Some(item) = window.editor.take_open_request() {
+                open_request = Some(item);
+            }
+            if let Some(dungeon) = window.editor.take_context_request() {
+                context_requests.push((window.viewport_id, dungeon));
+            }
+            if let Some(request) = window.editor.take_cell_open_request() {
+                cell_open_request = Some(request);
+            }
             if window.editor.take_blocked_edit() && self.copy_prompt.is_none() {
                 let subject = match self.opened_item {
                     Some(OpenedItem::DaggerfallDungeon(_)) => CopySubject::DungeonAndRoom,
@@ -1067,8 +1361,40 @@ impl DungeonMakerApp {
             window.is_open
         });
 
+        // Load the surrounding cells of dungeons newly selected under "Used in".
+        for (viewport_id, dungeon) in context_requests {
+            let Some(window_index) =
+                self.room_windows.iter().position(|window| window.viewport_id == viewport_id)
+            else {
+                continue;
+            };
+            let room_index = self.room_windows[window_index].dungeon_room_index;
+            let cell = match &self.workspace {
+                Workspace::Dungeon(view) => room_index.and_then(|index| {
+                    let room = view.room(index)?;
+                    Some((room.block_name.clone(), room.project_room, view.layout_index(index)))
+                }),
+                _ => None,
+            };
+            let context = match (dungeon, cell) {
+                (Some(dungeon), Some((block_name, project_room, layout_index))) => {
+                    // The window's own place counts only in the dungeon it was opened from.
+                    let layout_index = layout_index.filter(|_| self.opened_item.as_ref() == Some(&dungeon));
+                    self.dungeon_context(&dungeon, &block_name, project_room, layout_index)
+                }
+                _ => None,
+            };
+            self.room_windows[window_index].editor.set_dungeon_context(context);
+        }
+
         if let Some(choice) = copy_choice {
             self.answer_copy_prompt(choice);
+        }
+        if let Some((dungeon, layout_index)) = cell_open_request {
+            self.open_context_cell(context, dungeon, layout_index, true);
+        }
+        if let Some(item) = open_request {
+            self.open_item(&item);
         }
     }
 

@@ -18,6 +18,8 @@ pub enum SceneEdit {
     Insert { index: usize, object: SceneObject },
     /// Remove the object at `index`.
     Remove { index: usize },
+    /// Several edits undone or redone as one step, applied in order.
+    Group(Vec<SceneEdit>),
 }
 
 impl SceneEdit {
@@ -44,6 +46,15 @@ impl SceneEdit {
                 }
                 let object = objects.remove(index);
                 Some(Self::Insert { index, object })
+            }
+            Self::Group(edits) => {
+                // The inverse undoes the edits in reverse order.
+                let mut inverses = Vec::with_capacity(edits.len());
+                for edit in edits {
+                    inverses.push(edit.apply(objects)?);
+                }
+                inverses.reverse();
+                Some(Self::Group(inverses))
             }
         }
     }
@@ -113,18 +124,41 @@ impl EditHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::SceneObjectKind;
+    use crate::scene::{LightData, SceneObjectKind};
     use glam::Vec3;
 
     fn object(name: &str) -> SceneObject {
         SceneObject {
             name: name.to_string(),
             group_index: 0,
-            kind: SceneObjectKind::Light { radius: 1.0 },
+            kind: SceneObjectKind::Light { radius: 1.0, data: LightData::default() },
             position: Vec3::ZERO,
             rotation_degrees: Vec3::ZERO,
             visible: true,
+            id: 0,
+            next: None,
         }
+    }
+
+    #[test]
+    fn grouped_edits_undo_together() {
+        let mut objects = vec![object("a"), object("b")];
+        let mut history = EditHistory::default();
+
+        // Rename both objects as one step.
+        let reverts = vec![
+            SceneEdit::Replace { index: 0, object: objects[0].clone() },
+            SceneEdit::Replace { index: 1, object: objects[1].clone() },
+        ];
+        objects[0].name = "x".to_string();
+        objects[1].name = "y".to_string();
+        history.record(SceneEdit::Group(reverts));
+
+        assert!(history.undo(&mut objects));
+        assert_eq!((objects[0].name.as_str(), objects[1].name.as_str()), ("a", "b"));
+        assert!(!history.can_undo());
+        assert!(history.redo(&mut objects));
+        assert_eq!((objects[0].name.as_str(), objects[1].name.as_str()), ("x", "y"));
     }
 
     #[test]

@@ -125,6 +125,8 @@ impl LineVertex {
 #[derive(Default)]
 pub struct LineBatch {
     pub vertices: Vec<LineVertex>,
+    /// Vertices from this index on are drawn over everything rather than depth tested.
+    pub overlay_start: Option<usize>,
 }
 
 impl LineBatch {

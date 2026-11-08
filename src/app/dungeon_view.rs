@@ -22,7 +22,7 @@ use crate::encounters::DungeonType;
 use crate::picking::{intersect_horizontal_plane, pick_object, PickOptions};
 use crate::project::{ItemId, Project, ProjectDungeonRoom};
 use crate::render::{FrameRequest, RoomOutline, ViewSettings, ViewportTarget};
-use crate::scene::{Scene, SceneObject};
+use crate::scene::{ObjectId, Scene, SceneObject};
 
 /// Something the user did in the dungeon's properties panel, for the application to carry out.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +31,8 @@ pub enum DungeonPropertiesAction {
     SetType(DungeonType),
     /// Open room `index` in a room editor window.
     OpenRoom(usize),
+    /// Make room `index` the dungeon's starting cell, instead of any other.
+    MakeStart(usize),
     /// The user tried to change a dungeon from Daggerfall, which cannot be edited.
     EditBlocked,
 }
@@ -62,6 +64,13 @@ pub struct DungeonRoom {
     layout_index: usize,
     /// Whether the room's objects were changed since the dungeon was loaded.
     edited: bool,
+    /// Whether the cell itself has an exit door, so it can be the start cell.
+    /// (Rooms other than the start are shown without their exit doors, so this
+    /// is worked out from the cell, not from `scene`.)
+    pub has_exit: bool,
+    /// Whether the cell has a start marker, where the player is placed on
+    /// entering the dungeon, so it can be the start cell.
+    pub has_start_marker: bool,
 }
 
 /// State of the dungeon view.
@@ -76,6 +85,8 @@ pub struct DungeonView {
     /// Every room's objects moved into world space, with `group_index` set to the room index.
     combined_scene: Scene,
     room_outlines: Vec<RoomOutline>,
+    /// The water surface of each cell that has water.
+    water_planes: Vec<Vec3>,
     camera: OrbitCamera,
     view_settings: ViewSettings,
     grid_height: f32,
@@ -87,6 +98,8 @@ pub struct DungeonView {
     name_edit: Option<String>,
     /// Room whose right-click menu (for naming it) is open.
     renamed_room: Option<usize>,
+    /// Room the user chose "Make Start" for in the viewport's menu.
+    make_start_request: Option<usize>,
     last_pointer_position: Option<egui::Pos2>,
 }
 
@@ -109,6 +122,11 @@ impl DungeonView {
             .enumerate()
             .filter_map(|(layout_index, placement)| match load_room_scene(placement, project, library) {
                 Ok((scene, project_room)) => Some(DungeonRoom {
+                    has_exit: match project_room {
+                        Some(_) => scene.objects.iter().any(SceneObject::is_exit_door),
+                        None => cell_has_exit(&placement.block_name, library),
+                    },
+                    has_start_marker: scene.start_marker_index().is_some(),
                     block_name: placement.block_name.clone(),
                     origin: Vec3::new(
                         placement.grid_x as f32 * RDB_BLOCK_SIDE,
@@ -135,6 +153,7 @@ impl DungeonView {
             rooms,
             combined_scene: Scene::default(),
             room_outlines: Vec::new(),
+            water_planes: Vec::new(),
             camera: OrbitCamera::default(),
             view_settings: ViewSettings::default(),
             grid_height: 0.0,
@@ -143,6 +162,7 @@ impl DungeonView {
             list_hovered_room: None,
             name_edit: None,
             renamed_room: None,
+            make_start_request: None,
             last_pointer_position: None,
         };
         view.rebuild_combined_scene();
@@ -151,6 +171,36 @@ impl DungeonView {
             view.grid_height = minimum.y - 0.05;
         }
         (view, problems)
+    }
+
+    /// Returns, once, the room the user chose "Make Start" for in the viewport.
+    pub fn take_make_start_request(&mut self) -> Option<usize> {
+        self.make_start_request.take()
+    }
+
+    /// Makes room `room_index` the starting cell and every other room not.
+    ///
+    /// As in the game, only the starting cell keeps its exit doors, so the
+    /// Daggerfall cells that gain or lose the start are loaded again with or
+    /// without them. (Project cells are shown as saved.)
+    pub fn set_start_room(&mut self, room_index: usize, library: &mut Arena2Library) {
+        for (index, room) in self.rooms.iter_mut().enumerate() {
+            let is_start = index == room_index;
+            if room.is_starting_block == is_start {
+                continue;
+            }
+            room.is_starting_block = is_start;
+            if room.project_room.is_none() {
+                if let Ok(block) = library.rdb_block(&room.block_name) {
+                    let mut scene = Scene::from_rdb_block(&block);
+                    if !is_start {
+                        scene.remove_exit_doors();
+                    }
+                    room.scene = scene;
+                }
+            }
+        }
+        self.rebuild_combined_scene();
     }
 
     /// Returns room `room_index`, if it exists.
@@ -185,6 +235,10 @@ impl DungeonView {
         if room.scene.objects != objects {
             room.scene.objects = objects.to_vec();
             room.edited = true;
+            if room.project_room.is_some() {
+                room.has_exit = objects.iter().any(SceneObject::is_exit_door);
+            }
+            room.has_start_marker = room.scene.start_marker_index().is_some();
             self.rebuild_combined_scene();
         }
     }
@@ -253,7 +307,7 @@ impl DungeonView {
                 ui.heading("Properties");
                 ui.separator();
                 egui::Grid::new("dungeon_property_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label("Name");
+                    ui.label("Name").on_hover_text("The dungeon's name. It can be changed for your own dungeons.");
                     self.show_name_field(ui, details.read_only, &mut action);
                     ui.end_row();
 
@@ -261,11 +315,11 @@ impl DungeonView {
                     self.show_type_field(ui, details.read_only, &mut action);
                     ui.end_row();
 
-                    ui.label("Region");
+                    ui.label("Region").on_hover_text("The region of the Iliac Bay the dungeon belongs to.");
                     ui.label(&self.region_name);
                     ui.end_row();
 
-                    ui.label("Source");
+                    ui.label("Source").on_hover_text("Where the dungeon comes from: Daggerfall's own data (read-only), or a copy in your project.");
                     match (details.read_only, details.based_on) {
                         (true, _) => ui.label("Daggerfall (read-only)"),
                         (false, Some(original)) => ui.label(format!("Copy of {original}")),
@@ -273,13 +327,13 @@ impl DungeonView {
                     };
                     ui.end_row();
 
-                    ui.label("Cells");
+                    ui.label("Cells").on_hover_text("Number of cells (RDB blocks) the dungeon is built from.");
                     ui.label(self.rooms.len().to_string());
                     ui.end_row();
                 });
 
                 ui.add_space(8.0);
-                ui.strong("Cells");
+                ui.strong("Cells").on_hover_text("Every cell in the dungeon. Hover one to highlight it in the view, double-click to open it.");
                 ui.label(egui::RichText::new("Hover to highlight, double-click to edit").weak());
                 let mut hovered_row = None;
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -305,7 +359,7 @@ impl DungeonView {
                             })
                             .inner
                             .on_hover_text(format!(
-                                "{} ({})\nDouble-click to open it in a cell editor",
+                                "{} ({})\nDouble-click to open it in a cell editor, right-click for more",
                                 room.block_name,
                                 category_description(&room.block_name)
                             ));
@@ -315,6 +369,11 @@ impl DungeonView {
                         if response.double_clicked() {
                             action = Some(DungeonPropertiesAction::OpenRoom(room_index));
                         }
+                        response.context_menu(|ui| {
+                            if make_start_button(ui, room) {
+                                action = Some(DungeonPropertiesAction::MakeStart(room_index));
+                            }
+                        });
                     }
                 });
                 self.list_hovered_room = hovered_row;
@@ -398,8 +457,12 @@ impl DungeonView {
             camera: &self.camera,
             selected_object: None,
             hovered_object: None,
+            selected_objects: &[],
+            hovered_objects: &[],
             highlighted_group: highlighted_room,
             placement_preview: None,
+            context_scene: None,
+            water_planes: &self.water_planes,
             room_outlines: &self.room_outlines,
             settings: &self.view_settings,
             grid_height: self.grid_height,
@@ -420,6 +483,10 @@ impl DungeonView {
             };
             ui.strong(&room.block_name);
             show_room_name_field(ui, &room.block_name, resources.custom_names);
+            ui.separator();
+            if make_start_button(ui, room) {
+                self.make_start_request = self.renamed_room;
+            }
         });
 
         let double_clicked = response.double_clicked_by(egui::PointerButton::Primary);
@@ -510,7 +577,10 @@ impl DungeonView {
             .iter()
             .enumerate()
             .flat_map(|(room_index, room)| {
+                let id_base = (room_index as ObjectId + 1) << 16;
                 room.scene.objects.iter().map(move |object| SceneObject {
+                    id: id_base | object.id,
+                    next: object.next.map(|next| id_base | next),
                     position: object.position + room.origin,
                     group_index: room_index,
                     ..object.clone()
@@ -520,12 +590,72 @@ impl DungeonView {
         self.combined_scene = Scene { block_name: self.name.clone(), objects };
         self.room_outlines =
             self.rooms.iter().map(|room| RoomOutline { origin: room.origin, highlighted: false }).collect();
+        self.water_planes = self
+            .rooms
+            .iter()
+            .filter_map(|room| Some(room.origin + Vec3::new(0.0, room.scene.water_level()?, 0.0)))
+            .collect();
     }
+}
+
+/// Adds the "Make Start" entry to a cell's menu. Returns `true` when chosen.
+///
+/// A cell without an exit door (the player could not leave the dungeon) or
+/// without a start marker (the player would have nowhere to arrive) cannot be
+/// the start; the entry is then disabled and the menu says why.
+fn make_start_button(ui: &mut egui::Ui, room: &DungeonRoom) -> bool {
+    let response = ui
+        .add_enabled(room.can_be_start(), egui::Button::new("Make Start"))
+        .on_hover_text(
+            "Makes this the cell the player enters the dungeon in. Only the start cell keeps its exit \
+             doors; the cell that was the start before stops being it.",
+        )
+        .on_disabled_hover_text(if room.is_starting_block {
+            "This is already the dungeon's start cell"
+        } else {
+            "A start cell needs an exit door (model 70300), so the player can leave the dungeon, and a \
+             start marker, where the player arrives"
+        });
+    if !room.is_starting_block {
+        for problem in room.start_problems() {
+            ui.colored_label(egui::Color32::from_rgb(255, 190, 70), format!("⚠ {problem}"));
+        }
+    }
+    if response.clicked() {
+        ui.close_menu();
+    }
+    response.clicked()
+}
+
+impl DungeonRoom {
+    /// Why the cell cannot be the dungeon's start cell; empty if it can.
+    pub fn start_problems(&self) -> Vec<&'static str> {
+        let mut problems = Vec::new();
+        if !self.has_exit {
+            problems.push("No exit exists for this cell");
+        }
+        if !self.has_start_marker {
+            problems.push("No start marker exists for this cell");
+        }
+        problems
+    }
+
+    /// Whether "Make Start" can make this cell the start.
+    fn can_be_start(&self) -> bool {
+        !self.is_starting_block && self.start_problems().is_empty()
+    }
+}
+
+/// Whether Daggerfall's cell `block_name` has an exit door of its own.
+fn cell_has_exit(block_name: &str, library: &mut Arena2Library) -> bool {
+    library
+        .rdb_block(block_name)
+        .is_ok_and(|block| Scene::from_rdb_block(&block).objects.iter().any(SceneObject::is_exit_door))
 }
 
 /// Builds the scene of one dungeon room: the project room it uses, or the
 /// Daggerfall block from the game data. Returns the project room's id too.
-fn load_room_scene(
+pub(super) fn load_room_scene(
     placement: &ProjectDungeonRoom,
     project: &Project,
     library: &mut Arena2Library,

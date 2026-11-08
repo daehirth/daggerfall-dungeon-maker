@@ -16,7 +16,10 @@ use crate::arena2::{Arena2Library, TextureKey};
 use crate::catalog::{flat_description, AssetCatalog};
 use crate::custom_names::CustomNames;
 use crate::render::ThumbnailStatus;
-use crate::scene::{default_model_object_name, FlatData, SceneObject, SceneObjectKind, ADDED_OBJECTS_GROUP};
+use crate::scene::{
+    default_model_object_name, FlatData, LightData, ModelData, SceneObject, SceneObjectKind,
+    ADDED_OBJECTS_GROUP,
+};
 
 /// Maximum number of thumbnails created per frame, to keep scrolling smooth.
 const THUMBNAILS_PER_FRAME: usize = 4;
@@ -72,7 +75,7 @@ impl PlaceableAsset {
             Self::Model { model_id } => {
                 let lift = library.model(model_id).map_or(0.0, |mesh| -mesh.bounds_min.y);
                 (
-                    SceneObjectKind::Model { model_id, has_action: false },
+                    SceneObjectKind::Model { model_id, data: ModelData::default() },
                     surface_point + Vec3::Y * lift,
                     Vec3::new(0.0, yaw_degrees, 0.0),
                 )
@@ -86,12 +89,15 @@ impl PlaceableAsset {
                 )
             }
             Self::Light => (
-                SceneObjectKind::Light { radius: DEFAULT_LIGHT_RADIUS },
+                SceneObjectKind::Light { radius: DEFAULT_LIGHT_RADIUS, data: LightData::default() },
                 surface_point + Vec3::Y * LIGHT_PLACEMENT_HEIGHT,
                 Vec3::ZERO,
             ),
         };
         SceneObject {
+            // The cell gives the object its id when it is placed.
+            id: 0,
+            next: None,
             name: self.name(),
             group_index: ADDED_OBJECTS_GROUP,
             kind,

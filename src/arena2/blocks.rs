@@ -42,6 +42,8 @@ pub struct RdbBlock {
 /// An object placed inside an RDB block.
 #[derive(Debug, Clone)]
 pub struct RdbObject {
+    /// Offset of the object's record in the block; actions link objects by it.
+    pub offset: i32,
     /// Index of the object list this object came from. Lists roughly correspond to rooms.
     pub group_index: usize,
     /// Position in native Daggerfall units relative to the block origin.
@@ -68,8 +70,25 @@ pub struct RdbModel {
     pub model_id: u32,
     /// Rotation around each axis in native units (2048 units per full turn).
     pub rotation: IVec3,
-    /// Whether the model has an action (door, lever, moving platform and so on).
-    pub has_action: bool,
+    /// What sets the model's action off (low bits) and, for doors, the starting lock (bits 4 and up).
+    pub trigger_and_lock: u32,
+    /// Sound played by the action.
+    pub sound: u8,
+    /// The model's action (door, lever, moving platform and so on), if it has one.
+    pub action: Option<RdbAction>,
+}
+
+/// An action attached to a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RdbAction {
+    /// Direction of movement (1-6), or an amount for some action types.
+    pub axis: u8,
+    pub duration: u16,
+    pub magnitude: u16,
+    /// Offset of the object the action triggers next, or negative for none.
+    pub next_offset: i32,
+    /// What the action does (move, rotate, open a door, teleport, hurt, …).
+    pub action_type: u8,
 }
 
 /// Flat specific object data.
@@ -83,6 +102,8 @@ pub struct RdbFlat {
     pub faction_or_mobile_id: u16,
     /// Action byte; 99 makes a fixed enemy passive.
     pub action: u8,
+    /// Offset of the object this flat's action triggers next, or negative for none.
+    pub next_offset: i32,
 }
 
 /// Light specific object data.
@@ -90,6 +111,9 @@ pub struct RdbFlat {
 pub struct RdbLight {
     /// Light radius in native units.
     pub radius: u16,
+    /// Two values of unknown meaning, kept as read.
+    pub unknown_1: u32,
+    pub unknown_2: u32,
 }
 
 /// The base fields shared by every object in a linked list.
@@ -161,7 +185,12 @@ fn read_object_list(
         };
 
         if let Some(kind) = read_object_resource(data, &object_header, model_ids)? {
-            objects.push(RdbObject { group_index, position: object_header.position, kind });
+            objects.push(RdbObject {
+                offset: offset as i32,
+                group_index,
+                position: object_header.position,
+                kind,
+            });
         }
 
         next_offset = usize::try_from(next).ok();
@@ -184,29 +213,42 @@ fn read_object_resource(
         RESOURCE_TYPE_MODEL => {
             let rotation = IVec3::new(reader.read_i32()?, reader.read_i32()?, reader.read_i32()?);
             let model_index = usize::from(reader.read_u16()?);
-            let _trigger_flag_and_starting_lock = reader.read_u32()?;
-            let _sound_index = reader.read_u8()?;
+            let trigger_and_lock = reader.read_u32()?;
+            let sound = reader.read_u8()?;
             let action_offset = reader.read_i32()?;
 
             let Some(model_id) = model_ids.get(model_index).copied().flatten() else {
                 log::warn!("RDB model object references empty model slot {model_index}");
                 return Ok(None);
             };
-            RdbObjectKind::Model(RdbModel { model_id, rotation, has_action: action_offset > 0 })
+            let action = match usize::try_from(action_offset) {
+                Ok(action_offset) if action_offset > 0 => {
+                    let mut action_reader = ByteReader::at(data, action_offset);
+                    Some(RdbAction {
+                        axis: action_reader.read_u8()?,
+                        duration: action_reader.read_u16()?,
+                        magnitude: action_reader.read_u16()?,
+                        next_offset: action_reader.read_i32()?,
+                        action_type: action_reader.read_u8()?,
+                    })
+                }
+                _ => None,
+            };
+            RdbObjectKind::Model(RdbModel { model_id, rotation, trigger_and_lock, sound, action })
         }
         RESOURCE_TYPE_FLAT => {
             let texture = TextureKey::from_bitfield(reader.read_u16()?);
             let flags = reader.read_u16()?;
             let faction_or_mobile_id = reader.read_u16()?;
-            let _next_object_offset = reader.read_i32()?;
+            let next_offset = reader.read_i32()?;
             let action = reader.read_u8()?;
-            RdbObjectKind::Flat(RdbFlat { texture, flags, faction_or_mobile_id, action })
+            RdbObjectKind::Flat(RdbFlat { texture, flags, faction_or_mobile_id, action, next_offset })
         }
         RESOURCE_TYPE_LIGHT => {
-            let _unknown_1 = reader.read_u32()?;
-            let _unknown_2 = reader.read_u32()?;
+            let unknown_1 = reader.read_u32()?;
+            let unknown_2 = reader.read_u32()?;
             let radius = reader.read_u16()?;
-            RdbObjectKind::Light(RdbLight { radius })
+            RdbObjectKind::Light(RdbLight { radius, unknown_1, unknown_2 })
         }
         other => {
             log::warn!("skipping RDB object with unknown resource type {other}");

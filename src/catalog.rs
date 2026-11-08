@@ -37,12 +37,13 @@ const TREASURE_FLAT_ARCHIVE: u16 = 216;
 const PEOPLE_FLAT_ARCHIVES: [u16; 13] = [175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 334, 346, 357];
 
 /// Known editor marker records in archive 199 and what the game uses them for.
-const MARKER_NAMES: [(u8, &str); 7] = [
+const MARKER_NAMES: [(u8, &str); 8] = [
     (8, "Enter marker"),
     (10, "Start marker"),
     (11, "Quest marker"),
     (15, "Random enemy"),
     (16, "Fixed enemy"),
+    (17, "Teleport marker"),
     (18, "Quest item marker"),
     (19, "Random treasure"),
 ];
@@ -241,7 +242,7 @@ impl AssetCatalog {
                         let usage = model_usage.entry(model.model_id).or_default();
                         usage.rooms.insert(room_index);
                         usage.placement_count += 1;
-                        if model.has_action {
+                        if model.action.is_some() {
                             usage.action_placement_count += 1;
                         }
                     }

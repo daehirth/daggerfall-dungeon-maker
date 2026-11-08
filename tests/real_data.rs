@@ -132,6 +132,30 @@ fn water_cells_have_underwater_enemy_markers() {
 }
 
 #[test]
+fn lever_action_links_to_a_door() {
+    use daggerfall_dungeon_maker::scene::{Scene, SceneObjectKind};
+    let Some(mut library) = open_library() else { return };
+
+    let scene = Scene::from_rdb_block(&library.rdb_block("N0000051.RDB").expect("block should parse"));
+    let lever = scene
+        .objects
+        .iter()
+        .find(|object| matches!(object.kind, SceneObjectKind::Model { model_id: 61028, .. }))
+        .expect("N0000051 has a lever");
+    let SceneObjectKind::Model { data, .. } = lever.kind else { unreachable!() };
+    let action = data.action.expect("the lever has an action");
+    println!("lever action: {action:?}, trigger {}, lock index {}", data.trigger(), data.lock_index());
+    let target =
+        scene.object_by_id(lever.next.expect("the lever links to an object")).expect("the target exists");
+    let SceneObjectKind::Model { model_id, .. } = target.kind else {
+        panic!("the lever should link to a model")
+    };
+    println!("lever opens model {model_id}");
+    let door = library.model(model_id).expect("target model loads");
+    assert!(door.door_kind().is_some(), "the lever should link to a door");
+}
+
+#[test]
 fn parses_every_rdb_block_and_its_models() {
     let Some(mut library) = open_library() else { return };
 

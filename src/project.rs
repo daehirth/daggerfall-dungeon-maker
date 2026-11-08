@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::arena2::{DungeonDefinition, TextureKey};
 use crate::encounters::DungeonType;
-use crate::scene::{FlatData, SceneObject, SceneObjectKind, ADDED_OBJECTS_GROUP};
+use crate::scene::{
+    FlatData, LightData, ModelData, ObjectAction, ObjectId, Scene, SceneObject, SceneObjectKind,
+    ADDED_OBJECTS_GROUP,
+};
 
 /// File extension of project files, without the dot.
 pub const PROJECT_FILE_EXTENSION: &str = "ddm";
@@ -352,6 +355,13 @@ impl Project {
         Some(copy_id)
     }
 
+    /// Every project dungeon, in tree order.
+    pub fn dungeons(&self) -> Vec<&ProjectDungeon> {
+        let mut dungeons = Vec::new();
+        collect_dungeons(&self.entries, &mut dungeons);
+        dungeons
+    }
+
     /// Names of the dungeons that use the project room `room_id`.
     pub fn dungeons_using(&self, room_id: ItemId) -> Vec<&str> {
         let mut dungeons = Vec::new();
@@ -595,6 +605,9 @@ struct DungeonRoomFile {
 
 #[derive(Serialize, Deserialize)]
 struct ObjectFile {
+    /// Identifies the object within its cell, for action links.
+    #[serde(default)]
+    id: ObjectId,
     name: String,
     /// The RDB object list the object came from; absent for objects the user placed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -604,6 +617,18 @@ struct ObjectFile {
     rotation: [f32; 3],
     #[serde(default = "default_visible", skip_serializing_if = "Clone::clone")]
     visible: bool,
+    /// Id of the object this one's action triggers next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next: Option<ObjectId>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ActionFile {
+    #[serde(rename = "type")]
+    action_type: u8,
+    axis: u8,
+    duration: u16,
+    magnitude: u16,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -611,8 +636,15 @@ struct ObjectFile {
 enum ObjectKindFile {
     Model {
         model_id: u32,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        /// Written by earlier versions instead of `action`.
+        #[serde(default, skip_serializing)]
         has_action: bool,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        trigger_and_lock: u32,
+        #[serde(default, skip_serializing_if = "is_zero_u8")]
+        sound: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<ActionFile>,
     },
     Flat {
         archive: u16,
@@ -627,7 +659,15 @@ enum ObjectKindFile {
     },
     Light {
         radius: f32,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        unknown_1: u32,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        unknown_2: u32,
     },
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 fn default_visible() -> bool {
@@ -696,7 +736,12 @@ impl EntryFile {
                 id: if id == 0 { project.new_id() } else { id },
                 name,
                 based_on,
-                objects: objects.into_iter().map(ObjectFile::into_object).collect(),
+                objects: {
+                    let mut objects: Vec<SceneObject> =
+                        objects.into_iter().map(ObjectFile::into_object).collect();
+                    Scene::ensure_object_ids(&mut objects);
+                    objects
+                },
             }),
             Self::Dungeon { name, region, dungeon_type, based_on, rooms } => {
                 ProjectEntry::Dungeon(ProjectDungeon {
@@ -724,7 +769,18 @@ impl EntryFile {
 impl ObjectFile {
     fn from_object(object: &SceneObject) -> Self {
         let kind = match object.kind {
-            SceneObjectKind::Model { model_id, has_action } => ObjectKindFile::Model { model_id, has_action },
+            SceneObjectKind::Model { model_id, data } => ObjectKindFile::Model {
+                model_id,
+                has_action: false,
+                trigger_and_lock: data.trigger_and_lock,
+                sound: data.sound,
+                action: data.action.map(|action| ActionFile {
+                    action_type: action.action_type,
+                    axis: action.axis,
+                    duration: action.duration,
+                    magnitude: action.magnitude,
+                }),
+            },
             SceneObjectKind::Flat { texture, data } => ObjectKindFile::Flat {
                 archive: texture.archive,
                 record: texture.record,
@@ -732,9 +788,13 @@ impl ObjectFile {
                 faction_or_mobile_id: data.faction_or_mobile_id,
                 action: data.action,
             },
-            SceneObjectKind::Light { radius } => ObjectKindFile::Light { radius },
+            SceneObjectKind::Light { radius, data } => {
+                ObjectKindFile::Light { radius, unknown_1: data.unknown_1, unknown_2: data.unknown_2 }
+            }
         };
         Self {
+            id: object.id,
+            next: object.next,
             name: object.name.clone(),
             group: (object.group_index != ADDED_OBJECTS_GROUP).then_some(object.group_index),
             kind,
@@ -746,16 +806,31 @@ impl ObjectFile {
 
     fn into_object(self) -> SceneObject {
         let kind = match self.kind {
-            ObjectKindFile::Model { model_id, has_action } => SceneObjectKind::Model { model_id, has_action },
+            ObjectKindFile::Model { model_id, has_action, trigger_and_lock, sound, action } => {
+                let action = action
+                    .map(|action| ObjectAction {
+                        action_type: action.action_type,
+                        axis: action.axis,
+                        duration: action.duration,
+                        magnitude: action.magnitude,
+                    })
+                    // Earlier versions only recorded that there was an action.
+                    .or(has_action.then(ObjectAction::default));
+                SceneObjectKind::Model { model_id, data: ModelData { trigger_and_lock, sound, action } }
+            }
             ObjectKindFile::Flat { archive, record, flags, faction_or_mobile_id, action } => {
                 SceneObjectKind::Flat {
                     texture: TextureKey::new(archive, record),
                     data: FlatData { flags, faction_or_mobile_id, action },
                 }
             }
-            ObjectKindFile::Light { radius } => SceneObjectKind::Light { radius },
+            ObjectKindFile::Light { radius, unknown_1, unknown_2 } => {
+                SceneObjectKind::Light { radius, data: LightData { unknown_1, unknown_2 } }
+            }
         };
         SceneObject {
+            id: self.id,
+            next: self.next,
             name: self.name,
             group_index: self.group.unwrap_or(ADDED_OBJECTS_GROUP),
             kind,
@@ -775,10 +850,19 @@ mod tests {
             SceneObject {
                 name: "Model 55000".to_string(),
                 group_index: 0,
-                kind: SceneObjectKind::Model { model_id: 55000, has_action: true },
+                kind: SceneObjectKind::Model {
+                    model_id: 55000,
+                    data: ModelData {
+                        trigger_and_lock: 0x22,
+                        sound: 7,
+                        action: Some(ObjectAction { action_type: 8, axis: 5, duration: 40, magnitude: 205 }),
+                    },
+                },
                 position: Vec3::new(1.25, -0.5, 30.1),
                 rotation_degrees: Vec3::new(0.0, 90.0, 0.0),
                 visible: true,
+                id: 1,
+                next: Some(3),
             },
             SceneObject {
                 name: "Torch".to_string(),
@@ -790,14 +874,18 @@ mod tests {
                 position: Vec3::new(0.1, 0.2, 0.3),
                 rotation_degrees: Vec3::ZERO,
                 visible: false,
+                id: 2,
+                next: None,
             },
             SceneObject {
                 name: "Light".to_string(),
                 group_index: 2,
-                kind: SceneObjectKind::Light { radius: 7.5 },
+                kind: SceneObjectKind::Light { radius: 7.5, data: LightData { unknown_1: 3, unknown_2: 0 } },
                 position: Vec3::ZERO,
                 rotation_degrees: Vec3::ZERO,
                 visible: true,
+                id: 3,
+                next: None,
             },
         ]
     }

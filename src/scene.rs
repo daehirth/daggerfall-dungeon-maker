@@ -8,7 +8,7 @@ use glam::{EulerRot, Mat4, Quat, Vec3};
 
 use crate::arena2::{
     native_to_world, Arena2Library, RdbBlock, RdbObjectKind, TextureKey, NATIVE_ROTATION_UNITS_PER_DEGREE,
-    WORLD_SCALE,
+    RDB_BLOCK_SIDE, WORLD_SCALE,
 };
 use crate::encounters::Enemy;
 
@@ -150,6 +150,275 @@ pub fn group_label(group_index: usize) -> String {
     }
 }
 
+/// Identifies an object within its cell. It stays the same while the cell is
+/// edited, so actions can link objects together.
+pub type ObjectId = u32;
+
+/// An action attached to a model or flat: what it does when triggered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectAction {
+    /// What the action does; see [`action_type_name`].
+    pub action_type: u8,
+    /// Direction of movement (1-6, see [`axis_name`]), or an amount for some action types.
+    pub axis: u8,
+    pub duration: u16,
+    pub magnitude: u16,
+}
+
+/// Settings a model placement can have besides its position and rotation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelData {
+    /// Trigger type (low 4 bits) and, for doors, starting lock index (bits 4 and up).
+    pub trigger_and_lock: u32,
+    /// Sound played by the action.
+    pub sound: u8,
+    /// The model's action, if it has one.
+    pub action: Option<ObjectAction>,
+}
+
+impl ModelData {
+    /// What sets the action off; see [`trigger_name`].
+    pub fn trigger(&self) -> u32 {
+        self.trigger_and_lock & 0x0f
+    }
+
+    /// Index into [`STARTING_LOCKS`].
+    pub fn lock_index(&self) -> u32 {
+        self.trigger_and_lock >> 4
+    }
+
+    pub fn set_trigger(&mut self, trigger: u32) {
+        self.trigger_and_lock = (self.trigger_and_lock & !0x0f) | (trigger & 0x0f);
+    }
+
+    pub fn set_lock_index(&mut self, lock_index: u32) {
+        self.trigger_and_lock = (self.trigger_and_lock & 0x0f) | (lock_index << 4);
+    }
+}
+
+/// Settings a light can have besides its position and radius.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LightData {
+    /// Two values of unknown meaning, kept as read.
+    pub unknown_1: u32,
+    pub unknown_2: u32,
+}
+
+/// Lock strengths a door can start with, indexed by [`ModelData::lock_index`].
+pub const STARTING_LOCKS: [u8; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 25, 30, 50, 128, 255];
+
+/// Trigger types: what sets an action off. From Daggerfall Unity's notes.
+pub const TRIGGER_TYPES: [(u32, &str); 9] = [
+    (0x00, "None"),
+    (0x01, "Walk on it"),
+    (0x02, "Click it"),
+    (0x03, "Bump into it"),
+    (0x05, "Attack it"),
+    (0x06, "Click it (door)"),
+    (0x08, "Click, attack or bump"),
+    (0x09, "Walk on it (2)"),
+    (0x0A, "Door opens or closes"),
+];
+
+/// Action types: what an action does. From Daggerfall Unity, which leaves several unknown.
+pub const ACTION_TYPES: [(u8, &str); 31] = [
+    (0x00, "None"),
+    (0x01, "Move"),
+    (0x02, "Slide −X"),
+    (0x03, "Slide +X"),
+    (0x04, "Slide up"),
+    (0x05, "Slide down"),
+    (0x06, "Slide −Z"),
+    (0x07, "Slide +Z"),
+    (0x08, "Rotate"),
+    (0x09, "Cast spell"),
+    (0x0B, "Show text"),
+    (0x0C, "Show text and ask"),
+    (0x0E, "Teleport to linked object"),
+    (0x10, "Lock door"),
+    (0x11, "Unlock door"),
+    (0x12, "Unlock and open door"),
+    (0x14, "Close door"),
+    (0x15, "Hurt (random)"),
+    (0x16, "Hurt (level × magnitude)"),
+    (0x17, "Hurt (level × magnitude) 23"),
+    (0x18, "Hurt (level × magnitude) 24"),
+    (0x19, "Hurt (level × magnitude) 25"),
+    (0x1A, "Poison"),
+    (0x1B, "Unknown 27"),
+    (0x1C, "Drain magicka"),
+    (0x1D, "Dialogue"),
+    (0x1E, "Activate linked object"),
+    (0x1F, "Set quest variable"),
+    (0x20, "Unknown 32"),
+    (0x32, "Unknown 50"),
+    (0x63, "Door text / passive enemy"),
+];
+
+/// Axis values of movement actions.
+pub const AXES: [(u8, &str); 7] =
+    [(0, "None"), (1, "−X"), (2, "+X"), (3, "−Y"), (4, "+Y"), (5, "−Z"), (6, "+Z")];
+
+/// Action type that opens (and unlocks) a door, which then swings open.
+pub const OPEN_DOOR_ACTION: u8 = 0x12;
+/// How a door swings open: degrees around its own vertical axis, over this many seconds.
+pub const DOOR_OPEN_DEGREES: f32 = -90.0;
+pub const DOOR_OPEN_SECONDS: f32 = 1.5;
+/// Action durations are stored in 1/20 s.
+const ACTION_TICKS_PER_SECOND: f32 = 20.0;
+/// The slide action types (2-7) always take 50 ticks, and move `axis × 8` game units.
+const SLIDE_TICKS: f32 = 50.0;
+const SLIDE_UNITS_PER_AXIS_STEP: f32 = 8.0;
+
+/// How an action moves its object when triggered, as Daggerfall Unity plays it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActionMotion {
+    /// Movement in world units.
+    pub translation: Vec3,
+    /// Turn in degrees around the object's own X, Y and Z axes.
+    pub rotation_degrees: Vec3,
+    /// How long the movement takes, at a steady speed.
+    pub seconds: f32,
+}
+
+impl ActionMotion {
+    /// A door swinging open.
+    pub fn door_swing() -> Self {
+        Self {
+            translation: Vec3::ZERO,
+            rotation_degrees: Vec3::new(0.0, DOOR_OPEN_DEGREES, 0.0),
+            seconds: DOOR_OPEN_SECONDS,
+        }
+    }
+}
+
+impl ObjectAction {
+    /// How the action moves its object, or `None` for actions that do not move
+    /// it (doors opened by an action swing open separately; see [`ActionMotion::door_swing`]).
+    ///
+    /// Follows Daggerfall Unity: Move goes `magnitude` game units along the axis,
+    /// the slide types go `axis × 8` units in their own direction over 2.5 s, and
+    /// Rotate turns by `magnitude` rotation units (2048 per turn) around the axis.
+    pub fn motion(&self) -> Option<ActionMotion> {
+        // Direction of movement for axis codes 1-6 (−X, +X, −Y, +Y, −Z, +Z), as Daggerfall Unity moves them.
+        let move_direction = |axis: u8| match axis {
+            1 => Some(Vec3::X),
+            2 => Some(-Vec3::X),
+            3 => Some(-Vec3::Y),
+            4 => Some(Vec3::Y),
+            5 => Some(Vec3::Z),
+            6 => Some(-Vec3::Z),
+            _ => None,
+        };
+        let seconds = f32::from(self.duration) / ACTION_TICKS_PER_SECOND;
+        let magnitude = f32::from(self.magnitude);
+        match self.action_type {
+            0x01 => Some(ActionMotion {
+                translation: move_direction(self.axis)? * magnitude * WORLD_SCALE,
+                rotation_degrees: Vec3::ZERO,
+                seconds,
+            }),
+            0x02..=0x07 => {
+                // Each slide type has a fixed direction; its axis value is the distance.
+                let axis = [2, 1, 4, 3, 6, 5][usize::from(self.action_type - 2)];
+                let distance = f32::from(self.axis) * SLIDE_UNITS_PER_AXIS_STEP;
+                Some(ActionMotion {
+                    translation: move_direction(axis)? * distance * WORLD_SCALE,
+                    rotation_degrees: Vec3::ZERO,
+                    seconds: SLIDE_TICKS / ACTION_TICKS_PER_SECOND,
+                })
+            }
+            0x08 => {
+                let turn = magnitude / NATIVE_ROTATION_UNITS_PER_DEGREE;
+                let rotation_degrees = match self.axis {
+                    1 => Vec3::new(-turn, 0.0, 0.0),
+                    2 => Vec3::new(turn, 0.0, 0.0),
+                    3 => Vec3::new(0.0, -turn, 0.0),
+                    4 => Vec3::new(0.0, turn, 0.0),
+                    5 => Vec3::new(0.0, 0.0, -turn),
+                    6 => Vec3::new(0.0, 0.0, turn),
+                    _ => return None,
+                };
+                Some(ActionMotion { translation: Vec3::ZERO, rotation_degrees, seconds })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl SceneObject {
+    /// The object moved `fraction` (0 to 1) of the way through `motion`.
+    pub fn moved_by(&self, motion: &ActionMotion, fraction: f32) -> SceneObject {
+        let mut moved = self.clone();
+        moved.position += motion.translation * fraction;
+        if motion.rotation_degrees != Vec3::ZERO {
+            let turn = motion.rotation_degrees * fraction * (std::f32::consts::PI / 180.0);
+            // Actions turn objects around their own axes.
+            let rotation = self.rotation() * Quat::from_euler(EulerRot::ZXY, turn.z, turn.x, turn.y);
+            let (z, x, y) = rotation.to_euler(EulerRot::ZXY);
+            moved.rotation_degrees = Vec3::new(x, y, z) * (180.0 / std::f32::consts::PI);
+        }
+        moved
+    }
+}
+
+/// How far, in world units, an object may reach past its cell's square before
+/// it counts as outside it (allowing for rounding in Daggerfall's own cells).
+pub const OUTSIDE_CELL_TOLERANCE: f32 = 0.05;
+
+impl SceneObject {
+    /// How far the object reaches outside its cell's square (the
+    /// [`RDB_BLOCK_SIDE`] square from the origin), sideways, in world units; 0
+    /// when it is inside. `bounds` is the model's own bounding box (minimum and
+    /// maximum corner); without it only the object's position counts.
+    pub fn distance_outside_cell(&self, bounds: Option<(Vec3, Vec3)>) -> f32 {
+        let points: Vec<Vec3> = match bounds {
+            Some((minimum, maximum)) => {
+                let matrix = self.model_matrix();
+                (0..8)
+                    .map(|corner| {
+                        let pick =
+                            |bit: usize, low: f32, high: f32| if corner & bit == 0 { low } else { high };
+                        matrix.transform_point3(Vec3::new(
+                            pick(1, minimum.x, maximum.x),
+                            pick(2, minimum.y, maximum.y),
+                            pick(4, minimum.z, maximum.z),
+                        ))
+                    })
+                    .collect()
+            }
+            None => vec![self.position],
+        };
+        points
+            .iter()
+            .flat_map(|point| [-point.x, point.x - RDB_BLOCK_SIDE, -point.z, point.z - RDB_BLOCK_SIDE])
+            .fold(0.0, f32::max)
+    }
+}
+
+/// Name of trigger type `trigger`, or "Unknown n".
+pub fn trigger_name(trigger: u32) -> String {
+    TRIGGER_TYPES
+        .iter()
+        .find(|(value, _)| *value == trigger)
+        .map_or_else(|| format!("Unknown {trigger}"), |(_, name)| (*name).to_string())
+}
+
+/// Name of action type `action_type`, or "Unknown n".
+pub fn action_type_name(action_type: u8) -> String {
+    ACTION_TYPES
+        .iter()
+        .find(|(value, _)| *value == action_type)
+        .map_or_else(|| format!("Unknown {action_type}"), |(_, name)| (*name).to_string())
+}
+
+/// Name of axis value `axis`; other values are amounts used by some action types.
+pub fn axis_name(axis: u8) -> String {
+    AXES.iter()
+        .find(|(value, _)| *value == axis)
+        .map_or_else(|| format!("Value {axis}"), |(_, name)| (*name).to_string())
+}
+
 /// What kind of thing a [`SceneObject`] represents.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SceneObjectKind {
@@ -157,8 +426,8 @@ pub enum SceneObjectKind {
     Model {
         /// Model record identifier.
         model_id: u32,
-        /// Whether the model is animated by an action (doors, levers, platforms).
-        has_action: bool,
+        /// Trigger, lock, sound and action.
+        data: ModelData,
     },
     /// A camera facing billboard sprite.
     Flat {
@@ -171,12 +440,16 @@ pub enum SceneObjectKind {
     Light {
         /// Radius of influence in world units.
         radius: f32,
+        /// Values kept from the game data.
+        data: LightData,
     },
 }
 
 /// A single editable object.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneObject {
+    /// Identifies the object within its cell.
+    pub id: ObjectId,
     /// Display name used in the outliner.
     pub name: String,
     /// Index of the RDB object list the object was loaded from.
@@ -189,9 +462,40 @@ pub struct SceneObject {
     pub rotation_degrees: Vec3,
     /// Hidden objects are not drawn and cannot be picked in the viewport.
     pub visible: bool,
+    /// The object this one's action triggers next, if any.
+    pub next: Option<ObjectId>,
 }
 
 impl SceneObject {
+    /// Whether the object can have an action: models and flats, but not lights.
+    pub fn can_have_action(&self) -> bool {
+        !matches!(self.kind, SceneObjectKind::Light { .. })
+    }
+
+    /// Makes the object's action trigger `target`. A model without an action
+    /// gets an empty one, for its type to be chosen afterwards.
+    pub fn tie_action_to(&mut self, target: ObjectId) {
+        if let SceneObjectKind::Model { data, .. } = &mut self.kind {
+            data.action.get_or_insert_with(ObjectAction::default);
+        }
+        self.next = Some(target);
+    }
+
+    /// Removes the object's action and its link.
+    pub fn remove_action(&mut self) {
+        match &mut self.kind {
+            SceneObjectKind::Model { data, .. } => data.action = None,
+            SceneObjectKind::Flat { data, .. } => data.action = 0,
+            SceneObjectKind::Light { .. } => {}
+        }
+        self.next = None;
+    }
+
+    /// Whether the object is a model with an action.
+    pub fn has_action(&self) -> bool {
+        matches!(self.kind, SceneObjectKind::Model { data: ModelData { action: Some(_), .. }, .. })
+    }
+
     /// Rotation of the object as a quaternion.
     ///
     /// Daggerfall applies yaw first, then pitch, then roll, which matches
@@ -261,7 +565,7 @@ impl SceneObject {
     /// Short type label for the user interface.
     pub fn kind_label(&self) -> &'static str {
         match self.kind {
-            SceneObjectKind::Model { has_action: true, .. } => "Action model",
+            SceneObjectKind::Model { .. } if self.has_action() => "Action model",
             SceneObjectKind::Model { .. } => "Model",
             SceneObjectKind::Flat { .. } if self.is_marker() => "Marker",
             SceneObjectKind::Flat { .. } => "Flat",
@@ -281,18 +585,38 @@ pub struct Scene {
 
 impl Scene {
     /// Builds a scene from an RDB block, placing the block's corner at the world origin.
+    ///
+    /// Objects are numbered in block order, and action links (which the game
+    /// stores as record offsets) become links between those numbers.
     pub fn from_rdb_block(block: &RdbBlock) -> Self {
+        let id_of = |offset: i32| -> Option<ObjectId> {
+            block.objects.iter().position(|object| object.offset == offset).map(|index| index as ObjectId + 1)
+        };
         let objects = block
             .objects
             .iter()
-            .map(|object| {
-                let (name, kind, rotation_degrees) = match &object.kind {
+            .enumerate()
+            .map(|(index, object)| {
+                let (name, kind, rotation_degrees, next) = match &object.kind {
                     RdbObjectKind::Model(model) => (
                         default_model_object_name(model.model_id),
-                        SceneObjectKind::Model { model_id: model.model_id, has_action: model.has_action },
+                        SceneObjectKind::Model {
+                            model_id: model.model_id,
+                            data: ModelData {
+                                trigger_and_lock: model.trigger_and_lock,
+                                sound: model.sound,
+                                action: model.action.map(|action| ObjectAction {
+                                    action_type: action.action_type,
+                                    axis: action.axis,
+                                    duration: action.duration,
+                                    magnitude: action.magnitude,
+                                }),
+                            },
+                        },
                         // Native rotations turn the opposite way to world rotations. Subtracting
                         // from zero (rather than negating) avoids showing "-0" in the UI.
                         Vec3::ZERO - model.rotation.as_vec3() / NATIVE_ROTATION_UNITS_PER_DEGREE,
+                        model.action.and_then(|action| id_of(action.next_offset)),
                     ),
                     RdbObjectKind::Flat(flat) => (
                         format!("Flat {}.{}", flat.texture.archive, flat.texture.record),
@@ -305,26 +629,91 @@ impl Scene {
                             },
                         },
                         Vec3::ZERO,
+                        id_of(flat.next_offset),
                     ),
                     RdbObjectKind::Light(light) => (
                         "Light".to_string(),
-                        SceneObjectKind::Light { radius: f32::from(light.radius) * WORLD_SCALE },
+                        SceneObjectKind::Light {
+                            radius: f32::from(light.radius) * WORLD_SCALE,
+                            data: LightData { unknown_1: light.unknown_1, unknown_2: light.unknown_2 },
+                        },
                         Vec3::ZERO,
+                        None,
                     ),
                 };
 
                 SceneObject {
+                    id: index as ObjectId + 1,
                     name,
                     group_index: object.group_index,
                     kind,
                     position: native_to_world(object.position),
                     rotation_degrees,
                     visible: true,
+                    next,
                 }
             })
             .collect();
 
         Self { block_name: block.name.clone(), objects }
+    }
+
+    /// An id no object in the cell uses yet, for a new object.
+    pub fn new_object_id(&self) -> ObjectId {
+        self.objects.iter().map(|object| object.id).max().unwrap_or(0) + 1
+    }
+
+    /// Numbers `objects` 1, 2, 3, … if any id is missing (0) or repeated, as in
+    /// files saved before objects had ids. Links cannot be kept then, so they are cleared.
+    pub fn ensure_object_ids(objects: &mut [SceneObject]) {
+        let mut seen = std::collections::HashSet::new();
+        if objects.iter().all(|object| object.id != 0 && seen.insert(object.id)) {
+            return;
+        }
+        for (index, object) in objects.iter_mut().enumerate() {
+            object.id = index as ObjectId + 1;
+            object.next = None;
+        }
+    }
+
+    /// Index of the cell's (first) start marker, which holds the cell's water level and castle flag.
+    pub fn start_marker_index(&self) -> Option<usize> {
+        self.objects.iter().position(|object| {
+            matches!(object.kind, SceneObjectKind::Flat { texture, .. }
+                if texture.archive == MARKER_TEXTURE_ARCHIVE && texture.record == START_MARKER_RECORD)
+        })
+    }
+
+    /// Indices of the objects whose action triggers the object `id`.
+    pub fn objects_triggering(&self, id: ObjectId) -> Vec<usize> {
+        self.objects
+            .iter()
+            .enumerate()
+            .filter(|(_, object)| object.next == Some(id))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Indices of the objects a trigger on object `start` reaches: `start`
+    /// itself, then each object its action triggers next, to the end of the
+    /// chain. The trigger is passed on along every link, whether or not the
+    /// objects in between do anything themselves. A chain that loops back stops
+    /// at the first object it would repeat.
+    pub fn action_chain(&self, start: usize) -> Vec<usize> {
+        let mut chain = Vec::new();
+        let mut current = Some(start).filter(|&index| index < self.objects.len());
+        while let Some(index) = current.filter(|index| !chain.contains(index)) {
+            chain.push(index);
+            current = self.objects[index]
+                .next
+                .and_then(|next| self.objects.iter().position(|object| object.id == next));
+        }
+        chain
+    }
+
+    /// The object with id `id`, if the cell has one.
+    pub fn object_by_id(&self, id: ObjectId) -> Option<&SceneObject> {
+        self.objects.iter().find(|object| object.id == id)
     }
 
     /// Height of the cell's water surface in world units, or `None` if it has no water.
@@ -419,10 +808,12 @@ mod tests {
         let object = SceneObject {
             name: String::new(),
             group_index: 0,
-            kind: SceneObjectKind::Light { radius: 1.0 },
+            kind: SceneObjectKind::Light { radius: 1.0, data: LightData::default() },
             position: Vec3::new(1.0, 2.0, 3.0),
             rotation_degrees: Vec3::new(30.0, 45.0, 60.0),
             visible: true,
+            id: 0,
+            next: None,
         };
         let radians = object.rotation_degrees * (std::f32::consts::PI / 180.0);
         let expected = Mat4::from_translation(object.position)
@@ -444,6 +835,8 @@ mod tests {
             position: Vec3::ZERO,
             rotation_degrees: Vec3::ZERO,
             visible: true,
+            id: 0,
+            next: None,
         };
         // The game ignores the high byte.
         let orc = marker(0x3507, 0, 0).fixed_enemy().unwrap();
@@ -469,6 +862,8 @@ mod tests {
             position: Vec3::ZERO,
             rotation_degrees: Vec3::ZERO,
             visible: true,
+            id: 0,
+            next: None,
         };
         let mage = FixedEnemy { mobile_id: 128, passive: true, gender: EnemyGender::Female };
         object.set_fixed_enemy(mage);
@@ -498,6 +893,8 @@ mod tests {
             position: Vec3::new(0.0, height, 0.0),
             rotation_degrees: Vec3::ZERO,
             visible: true,
+            id: 0,
+            next: None,
         };
         // A water byte of 5 puts the water 40 native units (1 m) up.
         let deep = flat(RANDOM_ENEMY_MARKER_RECORD, 0, 0.5);
@@ -515,14 +912,131 @@ mod tests {
     }
 
     #[test]
+    fn missing_ids_are_filled_in() {
+        let light = |id| SceneObject {
+            id,
+            name: String::new(),
+            group_index: 0,
+            kind: SceneObjectKind::Light { radius: 1.0, data: LightData::default() },
+            position: Vec3::ZERO,
+            rotation_degrees: Vec3::ZERO,
+            visible: true,
+            next: Some(7),
+        };
+        let mut good = vec![light(4), light(9)];
+        Scene::ensure_object_ids(&mut good);
+        assert_eq!(
+            good.iter().map(|object| (object.id, object.next)).collect::<Vec<_>>(),
+            [(4, Some(7)), (9, Some(7))]
+        );
+
+        // Files saved before objects had ids load with id 0; they are numbered and lose links.
+        let mut old = vec![light(0), light(0), light(0)];
+        Scene::ensure_object_ids(&mut old);
+        assert_eq!(
+            old.iter().map(|object| (object.id, object.next)).collect::<Vec<_>>(),
+            [(1, None), (2, None), (3, None)]
+        );
+        let scene = Scene { block_name: String::new(), objects: old };
+        assert_eq!(scene.new_object_id(), 4);
+    }
+
+    #[test]
+    fn action_motions_follow_daggerfall_unity() {
+        let action =
+            |action_type, axis, duration, magnitude| ObjectAction { action_type, axis, duration, magnitude };
+        // The lever in N0000051: Rotate around −Z by 205 units (36°) in 0.9 s.
+        let lever = action(0x08, 5, 18, 205).motion().unwrap();
+        assert!((lever.rotation_degrees.z + 36.03).abs() < 0.01);
+        assert!((lever.seconds - 0.9).abs() < 1e-6);
+        // Move +Y 128 units: 3.2 m up.
+        let lift = action(0x01, 4, 40, 128).motion().unwrap();
+        assert_eq!(lift.translation, Vec3::new(0.0, 3.2, 0.0));
+        // Slide down (type 5) with axis 10: 80 units (2 m) down in 2.5 s, whatever the duration says.
+        let slide = action(0x05, 10, 3, 999).motion().unwrap();
+        assert_eq!((slide.translation, slide.seconds), (Vec3::new(0.0, -2.0, 0.0), 2.5));
+        // Doors, teleports and traps do not move their object.
+        assert_eq!(action(OPEN_DOOR_ACTION, 0, 0, 0).motion(), None);
+        assert_eq!(action(0x0E, 0, 0, 0).motion(), None);
+
+        let object = SceneObject {
+            id: 1,
+            name: String::new(),
+            group_index: 0,
+            kind: SceneObjectKind::Light { radius: 1.0, data: LightData::default() },
+            position: Vec3::ZERO,
+            rotation_degrees: Vec3::new(0.0, 90.0, 0.0),
+            visible: true,
+            next: None,
+        };
+        let halfway = object.moved_by(&lift, 0.5);
+        assert_eq!(halfway.position, Vec3::new(0.0, 1.6, 0.0));
+        let turned = object.moved_by(&ActionMotion::door_swing(), 1.0);
+        assert!((turned.rotation_degrees.y - 0.0).abs() < 0.01, "{:?}", turned.rotation_degrees);
+    }
+
+    #[test]
+    fn action_chain_follows_every_link_to_the_end() {
+        let model = |id, action: Option<ObjectAction>, next| SceneObject {
+            id,
+            name: String::new(),
+            group_index: 0,
+            kind: SceneObjectKind::Model { model_id: 1, data: ModelData { action, ..ModelData::default() } },
+            position: Vec3::ZERO,
+            rotation_degrees: Vec3::ZERO,
+            visible: true,
+            next,
+        };
+        let rotate = Some(ObjectAction { action_type: 0x08, axis: 4, duration: 20, magnitude: 512 });
+        // Lever (10) -> object with no action (20) -> moving wall (30) -> lever again (loop).
+        let scene = Scene {
+            block_name: String::new(),
+            objects: vec![
+                model(30, rotate, Some(10)),
+                model(10, rotate, Some(20)),
+                model(99, None, None),
+                model(20, None, Some(30)),
+            ],
+        };
+        assert_eq!(scene.action_chain(1), vec![1, 3, 0]);
+        assert_eq!(scene.action_chain(2), vec![2]);
+        assert_eq!(scene.action_chain(7), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn distance_outside_cell_uses_the_model_box() {
+        let object = |x: f32, rotation_y: f32| SceneObject {
+            id: 1,
+            name: String::new(),
+            group_index: 0,
+            kind: SceneObjectKind::Light { radius: 1.0, data: LightData::default() },
+            position: Vec3::new(x, 0.0, 10.0),
+            rotation_degrees: Vec3::new(0.0, rotation_y, 0.0),
+            visible: true,
+            next: None,
+        };
+        let box_2m = Some((Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 2.0, 1.0)));
+        assert_eq!(object(10.0, 0.0).distance_outside_cell(None), 0.0);
+        assert_eq!(object(10.0, 0.0).distance_outside_cell(box_2m), 0.0);
+        // A 2 m box centred 0.5 m from the edge pokes 0.5 m out.
+        assert!((object(0.5, 0.0).distance_outside_cell(box_2m) - 0.5).abs() < 1e-5);
+        assert!((object(RDB_BLOCK_SIDE + 3.0, 0.0).distance_outside_cell(None) - 3.0).abs() < 1e-4);
+        // Turned 45°, its corners reach further: √2 − 0.5.
+        let turned = object(0.5, 45.0).distance_outside_cell(box_2m);
+        assert!((turned - (2f32.sqrt() - 0.5)).abs() < 1e-4, "{turned}");
+    }
+
+    #[test]
     fn remove_exit_doors_keeps_other_models() {
         let model = |model_id| SceneObject {
             name: format!("Model {model_id}"),
             group_index: 0,
-            kind: SceneObjectKind::Model { model_id, has_action: false },
+            kind: SceneObjectKind::Model { model_id, data: ModelData::default() },
             position: Vec3::ZERO,
             rotation_degrees: Vec3::ZERO,
             visible: true,
+            id: 0,
+            next: None,
         };
         let mut scene = Scene {
             block_name: "N0000000.RDB".to_string(),

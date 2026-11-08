@@ -333,11 +333,11 @@ impl ProjectPanel {
         };
         let item = OpenedItem::DaggerfallDungeon(index);
         let response = ui.selectable_label(opened == Some(&item), label).on_hover_text(format!(
-            "{} · {} cells\nDouble-click to open (read-only), or drag into the project to copy it",
+            "{} · {} cells\nClick to open (read-only), or drag into the project to copy it",
             dungeon.dungeon_type.map_or("Unknown type", |dungeon_type| dungeon_type.name()),
             dungeon.blocks.len()
         ));
-        daggerfall_item_interaction(&response, item, action);
+        daggerfall_item_interaction(&response, item, opened, action);
     }
 
     /// Draws a project entry, and a folder's contents.
@@ -426,6 +426,7 @@ impl ProjectPanel {
                     ProjectEntry::Folder(_) => unreachable!("folders are handled above"),
                 };
                 let item = OpenedItem::Project(id);
+                let is_dungeon = matches!(entry, ProjectEntry::Dungeon(_));
                 let response = ui
                     .horizontal(|ui| {
                         let response = ui.selectable_label(context.opened == Some(&item), entry.name());
@@ -434,11 +435,12 @@ impl ProjectPanel {
                     })
                     .inner
                     .on_hover_text(format!(
-                        "{details}\nDouble-click to open, right-click for more, drag to move"
+                        "{details}\n{} to open, right-click for more, drag to move",
+                        if is_dungeon { "Click" } else { "Double-click" }
                     ));
                 let response = drag_source(&response, DragPayload::Project(id));
                 drop_target(ui, &response, DropTarget::Before(id), DropHighlight::LineAbove, changes);
-                if response.double_clicked() {
+                if opens_item(&response, is_dungeon) && context.opened != Some(&item) {
                     *action = Some(PanelAction::Open(item.clone()));
                 }
                 response.context_menu(|ui| {
@@ -507,17 +509,28 @@ fn show_daggerfall_room(
         "{}\nDouble-click to open (read-only), or drag into the project to copy it",
         category_description(name)
     ));
-    daggerfall_item_interaction(&response, item, action);
+    daggerfall_item_interaction(&response, item, opened, action);
 }
 
-/// Double-click opens a Daggerfall item; right-click offers to open or copy it.
+/// Whether `response` opens its item: one click for a dungeon, a double-click for a cell.
+fn opens_item(response: &egui::Response, is_dungeon: bool) -> bool {
+    if is_dungeon {
+        response.clicked()
+    } else {
+        response.double_clicked()
+    }
+}
+
+/// Clicking opens a Daggerfall dungeon (double-clicking a cell); right-click offers to open or copy it.
 fn daggerfall_item_interaction(
     response: &egui::Response,
     item: OpenedItem,
+    opened: Option<&OpenedItem>,
     action: &mut Option<PanelAction>,
 ) {
     let response = drag_source(response, DragPayload::Daggerfall(item.clone()));
-    if response.double_clicked() {
+    let is_dungeon = matches!(item, OpenedItem::DaggerfallDungeon(_));
+    if opens_item(&response, is_dungeon) && opened != Some(&item) {
         *action = Some(PanelAction::Open(item.clone()));
     }
     response.context_menu(|ui| {

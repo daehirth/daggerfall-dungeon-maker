@@ -61,8 +61,8 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
 
 * The **project panel** (left) lists everything that can be opened. The
   **Daggerfall** list holds the game's own dungeons, grouped by region, and
-  cells; below it are the project's own cells and dungeons. Double-click an
-  entry to open it; the search box filters every list.
+  cells; below it are the project's own cells and dungeons. Click a dungeon
+  or double-click a cell to open it; the search box filters every list.
 * **File > Open cell…** (Ctrl+O) lists all 187 RDB blocks, filterable by type:
   `N` interior, `W` interior with water, `M` interior variant, `S` special
   (quest) and `B` border caps.
@@ -70,7 +70,9 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   `MAPS.BSA`, searchable and filterable by region. The dungeon is shown with
   all of its cells in place. Hovering a cell highlights the whole cell and its
   block outline; double-clicking it opens that cell in a separate window with
-  the full cell editor (closing the previously opened cell window). Changes
+  the full cell editor (closing the previously opened cell window). The window
+  starts with the dungeon selected under **Used in**, so the dungeon's other
+  cells show faded around the cell. Changes
   made in that window appear in the dungeon view. As in the game, the exit door
   (model 70300) is only kept in the starting cell, labelled **Start**; opening
   a cell on its own with **Open cell…** still shows all of its doors.
@@ -78,10 +80,76 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   region and cells. Hovering a cell in its list highlights it, and
   double-clicking opens it. The name and type of a project dungeon can be
   changed there; the type decides which enemies its random enemy markers become.
+* Right-clicking a cell in the dungeon view or in the Cells list offers
+  **Make Start**, which makes it the dungeon's start cell (where the player
+  enters) and stops the previous one from being it. Only the start cell keeps
+  its exit doors, so Daggerfall cells gain or lose them to match. A cell
+  without an exit door (model 70300), from which the player could not leave,
+  or without a start marker, where the player arrives, cannot be the start:
+  the option is disabled and the menu says "No exit exists for this cell"
+  and/or "No start marker exists for this cell". In a dungeon from Daggerfall
+  it offers to make a copy first.
 * The outliner (left) lists every object grouped by the block's object lists.
-  The properties panel (right) edits name, visibility, position and rotation.
+  The properties panel (right) edits name, visibility, position and rotation,
+  and under **Game settings** lists every setting Daggerfall stores with the
+  object, set or not: for models the trigger, starting lock, sound, action
+  (type, axis, duration, magnitude) and the object the action triggers next
+  (with **Go to**, which selects and frames it); for flats their flags, action, magnitude, sound and link;
+  for lights two values of unknown meaning. All of them can be changed in
+  project cells. Action links are kept by object id, so they survive edits and
+  are saved in project files. In the viewport each link is a red line, drawn
+  over walls, from the object to the one it triggers, with an arrowhead at the
+  target (**View > Action links** turns them off). Links stay within one cell.
+* **Preview action**, under Game settings, appears for objects whose action
+  moves something: it plays the action in the viewport as Daggerfall Unity
+  does, with every object down the chain moving at the same time (moves,
+  slides, rotations, and doors that an action opens swinging open), holds the
+  end for half a second and puts everything back. The cell is not changed.
+* Several objects can be selected with Shift+click (in the viewport or the
+  outliner; Shift+click a selected object to take it out) or by dragging a box
+  over empty space in the viewport: the objects inside it light up, and
+  releasing selects them (Shift adds them to the selection). Several selected
+  objects can only be moved: the gizmo sits at their middle and moves them all
+  together, as one undo step. With grid lock on, the last selected object
+  lands on the grid and the others keep their places relative to it.
+* Right-clicking an object (in the viewport or the outliner) opens its menu.
+  **Tie action to…** draws a red line from the object to the pointer; the
+  object under the pointer is highlighted, and clicking it makes the action
+  trigger it (Escape, right-click or clicking empty space cancels). A model
+  without an action gets an empty one, to be given a type under Game
+  settings. On an object that other objects' actions trigger, **Remove
+  actions** removes those actions, as one undo step.
+* With nothing selected, the properties panel shows the **cell**: name,
+  category, source, size, object and object list counts, and its water level
+  and castle flag (which live on the cell's start marker). A cell with water
+  shows its water surface as a see-through blue plane across its square, in
+  the cell editor and the dungeon view.
+* Every cell covers a 51.2 × 51.2 m square of the dungeon grid. Objects that
+  reach outside it (by their model's box, or their position) can overlap the
+  next cell in a dungeon, so they are marked ⚠ in the outliner, warned about
+  in their properties and in the status bar after moving them, and counted in
+  the cell's properties, with **Select them** to select them all. (Daggerfall's
+  own cells have 210 such objects in 68 cells, mostly by under half a metre.)
+* Selecting a marker adds a **Marker** section naming its kind and what the game
+  reads from it: water level and castle flag on start markers, slot and spawn
+  distance on random enemy markers, spawn distance (as well as the enemy) on
+  fixed enemy markers. Enter, quest, quest item, treasure and teleport markers
+  carry no data; the game uses only their position. A teleport marker is where
+  the player lands when an object whose action is Teleport, tied to the marker,
+  is triggered.
+* Resting the pointer on any property or button for half a second explains
+  what it does.
+* **Used in**, at the bottom of the properties panel, lists every dungeon that
+  uses the cell (for a cell copy, the project dungeons using that copy).
+  Clicking one shows that dungeon's other cells, faded and outlined, around
+  the cell being edited (click it again to hide them); double-clicking opens it
+  in the dungeon view. Hovering a faded cell outlines it and names it;
+  double-clicking it opens that cell instead, with the same dungeon still
+  selected and shown around it (in a cell window of the open dungeon, the cell
+  opens in a cell window as if double-clicked in the dungeon view).
 * **View** toggles back-face hiding (to look into cells from outside), the grid,
-  the block outline, the asset palette, and models, flats, editor markers and lights.
+  the block outline, the asset palette, models, flats, editor markers, lights
+  and action links.
 
 ### Projects
 
@@ -169,6 +237,8 @@ be moved, rotated, duplicated, deleted and undone like any other object.
 | Left click while placing | Place it (Shift to keep placing) |
 | R / Esc while placing | Rotate 90° / cancel |
 | Left click | Select object |
+| Shift + left click | Add to or take out of the selection |
+| Left drag on empty space | Select the objects inside a box (Shift adds them) |
 | Left drag on gizmo arrow | Move along that axis (Ctrl switches grid lock for that drag) |
 | G | Turn grid lock on or off |
 | Right drag | Orbit |
