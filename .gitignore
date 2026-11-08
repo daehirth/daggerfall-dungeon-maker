@@ -1,10 +1,11 @@
 /target
 
 # Never commit game data. The program reads it from the user's own ARENA2 folder at run time.
-# Anchored to the repository root: git on Windows ignores case, and an unanchored
-# "ARENA2/" would also match the src/arena2/ source folder.
+# Git on Windows ignores case, so these patterns must not also match source files:
+# "ARENA2/" is anchored to the repository root (src/arena2/ is source), and the
+# texture archives are matched by their three-digit number (src/arena2/texture.rs is source).
 /ARENA2/
 *.BSA
-TEXTURE.*
+TEXTURE.[0-9][0-9][0-9]
 *.COL
 *.PAL
