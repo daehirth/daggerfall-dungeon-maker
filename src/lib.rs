@@ -8,6 +8,8 @@
 //! * [`catalog`] lists the models, flats, markers and lights that can be placed,
 //!   and describes each model from its data.
 //! * [`custom_names`] holds the names users give rooms and models in the editor.
+//! * [`encounters`] lists which enemies random enemy markers can become, by dungeon type.
+//! * [`project`] reads and writes project files holding the user's own rooms and dungeons.
 //! * [`camera`] and [`picking`] provide viewport navigation and selection.
 //! * [`render`] draws a scene with wgpu into an offscreen texture.
 //! * [`app`] is the egui application: menus, dialogs, panels and the viewport.
@@ -17,6 +19,8 @@ pub mod arena2;
 pub mod camera;
 pub mod catalog;
 pub mod custom_names;
+pub mod encounters;
 pub mod picking;
+pub mod project;
 pub mod render;
 pub mod scene;

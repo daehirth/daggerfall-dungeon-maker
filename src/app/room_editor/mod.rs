@@ -16,6 +16,7 @@ use glam::Vec3;
 use super::viewport_tools::EditorResources;
 use crate::arena2::{Arena2Library, RDB_BLOCK_SIDE};
 use crate::camera::OrbitCamera;
+use crate::encounters::{enemy_chances, DungeonType, EncounterTable, EnemyChance};
 use crate::render::{ViewSettings, ViewportTarget};
 use crate::scene::{Scene, SceneObjectKind};
 use asset_palette::AssetPalette;
@@ -26,13 +27,24 @@ use viewport::ViewportState;
 const DUPLICATE_OFFSET: Vec3 = Vec3::new(1.0, 0.0, 0.0);
 /// Radius used to frame objects without a mesh (flats and lights), in world units.
 const DEFAULT_FOCUS_RADIUS: f32 = 2.0;
+/// Highest player level offered when previewing random enemies; past it the tables no longer change.
+const MAX_PREVIEW_LEVEL: u32 = 30;
 
-/// Grid snapping used when moving or placing objects.
+/// Snap steps offered for grid lock, in world units, with their labels. Each
+/// divides the 3.2 m floor grid evenly, so snap lines meet its lines.
+const SNAP_STEPS: [(f32, &str); 4] = [
+    (0.4, "0.4 m (16 units)"),
+    (0.8, "0.8 m (32 units)"),
+    (1.6, "1.6 m (64 units)"),
+    (3.2, "3.2 m (128 units)"),
+];
+
+/// Grid lock: snapping objects to a grid when moving or placing them.
 #[derive(Debug, Clone, Copy)]
 pub struct SnapSettings {
-    /// Whether snapping is on. Holding Ctrl while dragging inverts this.
+    /// Whether grid lock is on. Holding Ctrl while dragging inverts this for that drag.
     pub enabled: bool,
-    /// Snap increment in world units.
+    /// Snap increment in world units, one of [`SNAP_STEPS`].
     pub step: f32,
 }
 
@@ -66,6 +78,16 @@ pub struct RoomEditor {
     grid_height: f32,
     target: ViewportTarget,
     status_message: String,
+    /// Set for rooms from Daggerfall, which can be looked at but not changed.
+    read_only: bool,
+    /// Set when the user tried to change a read-only room, so the application can offer a copy.
+    edit_blocked: bool,
+    /// Name of the project room being edited; `None` for rooms from Daggerfall.
+    project_room_name: Option<String>,
+    /// Type of the dungeon the room was opened from, which decides what random enemy markers become.
+    dungeon_type: Option<DungeonType>,
+    /// Player level used to preview which enemies random enemy markers can become.
+    enemy_preview_level: u32,
 }
 
 impl RoomEditor {
@@ -87,6 +109,11 @@ impl RoomEditor {
             grid_height: 0.0,
             target: ViewportTarget::default(),
             status_message,
+            read_only: false,
+            edit_blocked: false,
+            project_room_name: None,
+            dungeon_type: None,
+            enemy_preview_level: 1,
         };
         editor.frame_room(library);
         if let Some((minimum, _)) = editor.scene.bounds(library) {
@@ -100,6 +127,63 @@ impl RoomEditor {
         &self.title
     }
 
+    /// Changes the title of the room, for example after it was renamed.
+    pub fn set_title(&mut self, title: String) {
+        self.title = title;
+    }
+
+    /// Makes the room read-only (a room from Daggerfall) or editable (a project room).
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+        self.edit_blocked = false;
+    }
+
+    /// Sets the project room name shown above the outliner; `None` for rooms from Daggerfall.
+    pub fn set_project_room_name(&mut self, name: Option<String>) {
+        self.project_room_name = name;
+    }
+
+    /// Sets the type of the dungeon the room is in, to preview what random enemy markers become.
+    pub fn set_dungeon_type(&mut self, dungeon_type: Option<DungeonType>) {
+        self.dungeon_type = dungeon_type;
+    }
+
+    /// The table the random enemy marker `object_index` picks from: the
+    /// underwater table below the cell's water level, otherwise the dungeon's.
+    /// `None` above water in a cell that is not open from a dungeon.
+    fn encounter_table(&self, object_index: usize) -> Option<EncounterTable> {
+        let object = self.scene.objects.get(object_index)?;
+        if self.scene.is_under_water(object) {
+            return Some(EncounterTable::Underwater);
+        }
+        self.dungeon_type.map(EncounterTable::Dungeon)
+    }
+
+    /// The enemies the random enemy marker `object_index` can become at the
+    /// preview level, most likely first; `None` if that depends on an unknown dungeon.
+    fn possible_enemies(&self, object_index: usize) -> Option<Vec<EnemyChance>> {
+        self.encounter_table(object_index).map(|table| enemy_chances(table, self.enemy_preview_level))
+    }
+
+    /// Whether the room belongs to the project (rather than being a Daggerfall room).
+    pub fn is_project_room(&self) -> bool {
+        self.project_room_name.is_some()
+    }
+
+    /// Returns `true` once after the user tried to change a read-only room.
+    pub fn take_blocked_edit(&mut self) -> bool {
+        std::mem::take(&mut self.edit_blocked)
+    }
+
+    /// Whether the room may be changed. For a read-only room this records the
+    /// attempt (see [`Self::take_blocked_edit`]) and returns `false`.
+    fn can_edit(&mut self) -> bool {
+        if self.read_only {
+            self.edit_blocked = true;
+        }
+        !self.read_only
+    }
+
     /// Base id of this editor's widgets, unique among open editors.
     pub fn id(&self) -> egui::Id {
         self.id
@@ -108,6 +192,11 @@ impl RoomEditor {
     /// Latest status message, for the status bar.
     pub fn status_message(&self) -> &str {
         &self.status_message
+    }
+
+    /// Replaces the status message, for example to report something the application did.
+    pub fn set_status_message(&mut self, message: String) {
+        self.status_message = message;
     }
 
     /// Frees the GPU image this editor renders into. Call when the editor is closed.
@@ -156,6 +245,9 @@ impl RoomEditor {
         }
         if shortcut(Modifiers::NONE, Key::Home) {
             self.frame_room(library);
+        }
+        if shortcut(Modifiers::NONE, Key::G) {
+            self.toggle_grid_lock();
         }
 
         // While an asset is armed for placement, Escape and R act on it instead of the selection.
@@ -206,16 +298,39 @@ impl RoomEditor {
             self.delete_selection();
         }
         ui.separator();
-        ui.checkbox(&mut self.snap.enabled, "Snap to grid while moving");
+        let grid_lock = egui::Checkbox::new(&mut self.snap.enabled, "Grid lock");
+        ui.add(grid_lock).on_hover_text("Snap objects to the grid while moving and placing them (G)");
         ui.horizontal(|ui| {
             ui.label("Snap step");
-            ui.add(egui::DragValue::new(&mut self.snap.step).speed(0.05).range(0.025..=10.0).suffix(" m"));
+            snap_step_selector(ui, self.id.with("menu_snap_step"), &mut self.snap.step);
         });
+    }
+
+    /// Adds the grid lock button and its snap step to a menu bar.
+    pub fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let label = if self.snap.enabled { "Grid lock: on" } else { "Grid lock: off" };
+        let response = ui.selectable_label(self.snap.enabled, label).on_hover_text(
+            "Snap objects to the grid while moving and placing them (G).\nHold Ctrl while dragging to switch it for that drag.",
+        );
+        if response.clicked() {
+            self.toggle_grid_lock();
+        }
+        snap_step_selector(ui, self.id.with("toolbar_snap_step"), &mut self.snap.step);
+    }
+
+    /// Turns grid lock on or off and says so in the status bar.
+    fn toggle_grid_lock(&mut self) {
+        self.snap.enabled = !self.snap.enabled;
+        self.status_message = if self.snap.enabled {
+            format!("Grid lock on: objects snap to a {} m grid", self.snap.step)
+        } else {
+            "Grid lock off".to_string()
+        };
     }
 
     /// Adds the View menu entries.
     pub fn view_menu(&mut self, ui: &mut egui::Ui, library: &mut Arena2Library) {
-        if ui.add(egui::Button::new("Frame room").shortcut_text("Home")).clicked() {
+        if ui.add(egui::Button::new("Frame cell").shortcut_text("Home")).clicked() {
             self.frame_room(library);
             ui.close_menu();
         }
@@ -260,6 +375,9 @@ impl RoomEditor {
         let Some(index) = self.selected_object.filter(|&index| index < self.scene.objects.len()) else {
             return;
         };
+        if !self.can_edit() {
+            return;
+        }
         let object = self.scene.objects.remove(index);
         self.status_message = format!("Deleted {}", object.name);
         self.history.record(SceneEdit::Insert { index, object });
@@ -268,6 +386,9 @@ impl RoomEditor {
 
     /// Copies the selected object and selects the copy.
     fn duplicate_selection(&mut self) {
+        if self.selected_object.is_none_or(|index| index >= self.scene.objects.len()) || !self.can_edit() {
+            return;
+        }
         let Some(original) = self.selected_object.and_then(|index| self.scene.objects.get(index)) else {
             return;
         };
@@ -282,7 +403,12 @@ impl RoomEditor {
 
     /// Turns the selected object around the vertical axis by `degrees`.
     fn rotate_selection(&mut self, degrees: f32) {
-        let Some(index) = self.selected_object else { return };
+        let Some(index) = self.selected_object.filter(|&index| index < self.scene.objects.len()) else {
+            return;
+        };
+        if !self.can_edit() {
+            return;
+        }
         let Some(object) = self.scene.objects.get_mut(index) else { return };
         self.history.record(SceneEdit::Replace { index, object: object.clone() });
         object.rotation_degrees.y = (object.rotation_degrees.y + degrees).rem_euclid(360.0);
@@ -313,9 +439,22 @@ impl RoomEditor {
     }
 }
 
+/// Draws a drop-down choosing the grid lock snap step from [`SNAP_STEPS`].
+fn snap_step_selector(ui: &mut egui::Ui, id: egui::Id, step: &mut f32) {
+    let selected = SNAP_STEPS
+        .iter()
+        .find(|(value, _)| (*value - *step).abs() < 1e-4)
+        .map_or_else(|| format!("{step} m"), |(_, label)| (*label).to_string());
+    egui::ComboBox::from_id_salt(id).selected_text(selected).show_ui(ui, |ui| {
+        for (value, label) in SNAP_STEPS {
+            ui.selectable_value(step, value, label);
+        }
+    });
+}
+
 /// Adds checkboxes for every [`ViewSettings`] option.
 pub fn view_settings_menu(ui: &mut egui::Ui, settings: &mut ViewSettings) {
-    ui.checkbox(&mut settings.cull_back_faces, "Hide back faces (see into rooms)");
+    ui.checkbox(&mut settings.cull_back_faces, "Hide back faces (see into cells)");
     ui.checkbox(&mut settings.show_grid, "Grid");
     ui.checkbox(&mut settings.show_room_outline, "Block outlines");
     ui.separator();

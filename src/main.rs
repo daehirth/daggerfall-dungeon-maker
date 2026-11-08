@@ -3,10 +3,11 @@
 
 //! Entry point: parses the command line, creates the window and starts the dungeon maker.
 //!
-//! Usage: `daggerfall-dungeon-maker [--arena2 <folder>] [--room <name.RDB>] [--dungeon <name>]`
+//! Usage: `daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [--dungeon <name>]`
 //!
 //! Every argument is optional. Without `--arena2` the program uses the
-//! folder chosen last time, or asks for one.
+//! folder chosen last time, or asks for one. Without a project file the
+//! project open last time is reopened.
 
 use std::path::PathBuf;
 
@@ -33,15 +34,19 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Reads `--arena2 <folder>`, `--room <name>` and `--dungeon <name>` from the command line,
-/// ignoring anything else.
+/// Reads a project file, `--arena2 <folder>`, `--cell <name>` (or `--room`) and `--dungeon <name>` from the
+/// command line, ignoring anything else.
 fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> StartupOptions {
     let mut options = StartupOptions::default();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--arena2" => options.arena2_folder = arguments.next().map(PathBuf::from),
-            "--room" => options.room_name = arguments.next(),
+            "--cell" | "--room" => options.room_name = arguments.next(),
             "--dungeon" => options.dungeon_name = arguments.next(),
+            "--project" => options.project_file = arguments.next().map(PathBuf::from),
+            path if path.to_ascii_lowercase().ends_with(".ddm") => {
+                options.project_file = Some(PathBuf::from(path))
+            }
             unknown => log::warn!("ignoring unknown argument '{unknown}'"),
         }
     }

@@ -56,7 +56,7 @@ impl DungeonBrowser {
                         for &(dungeon_index, dungeon) in &visible_dungeons[row_range] {
                             let is_highlighted = self.highlighted_dungeon == Some(dungeon_index);
                             let label = format!(
-                                "{}   ·   {}   ·   {} rooms",
+                                "{}   ·   {}   ·   {} cells",
                                 dungeon.name,
                                 dungeon.region_name,
                                 dungeon.blocks.len()

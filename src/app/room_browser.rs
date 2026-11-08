@@ -48,7 +48,7 @@ impl RoomBrowser {
 
         let mut chosen_room = None;
         let mut is_open = self.is_open;
-        egui::Window::new("Open room")
+        egui::Window::new("Open cell")
             .open(&mut is_open)
             .default_size([360.0, 480.0])
             .collapsible(false)
@@ -57,7 +57,7 @@ impl RoomBrowser {
                     ui.label("Search");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.search_text)
-                            .hint_text("e.g. N0000004 or your room name"),
+                            .hint_text("e.g. N0000004 or your cell name"),
                     );
                 });
                 ui.horizontal_wrapped(|ui| {
@@ -112,7 +112,7 @@ impl RoomBrowser {
                     });
                 }
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} rooms", visible_rooms.len()));
+                    ui.label(format!("{} cells", visible_rooms.len()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let can_open = self.highlighted_room.is_some();
                         if ui.add_enabled(can_open, egui::Button::new("Open")).clicked() {
@@ -130,7 +130,7 @@ impl RoomBrowser {
 /// Draws a text field that edits the user's name for the room `block_name`.
 pub fn show_room_name_field(ui: &mut egui::Ui, block_name: &str, custom_names: &mut CustomNames) {
     let mut name = custom_names.room_name_for_editing(block_name);
-    let field = egui::TextEdit::singleline(&mut name).hint_text("Your name for this room (editor only)");
+    let field = egui::TextEdit::singleline(&mut name).hint_text("Your name for this cell (editor only)");
     if ui.add(field).changed() {
         custom_names.set_room_name(block_name, &name);
     }

@@ -16,7 +16,7 @@ use crate::arena2::{Arena2Library, TextureKey};
 use crate::catalog::{flat_description, AssetCatalog};
 use crate::custom_names::CustomNames;
 use crate::render::ThumbnailStatus;
-use crate::scene::{default_model_object_name, SceneObject, SceneObjectKind, ADDED_OBJECTS_GROUP};
+use crate::scene::{default_model_object_name, FlatData, SceneObject, SceneObjectKind, ADDED_OBJECTS_GROUP};
 
 /// Maximum number of thumbnails created per frame, to keep scrolling smooth.
 const THUMBNAILS_PER_FRAME: usize = 4;
@@ -79,7 +79,11 @@ impl PlaceableAsset {
             }
             Self::Flat { texture } => {
                 let half_height = library.billboard_world_size(texture).map_or(0.5, |size| size.y * 0.5);
-                (SceneObjectKind::Flat { texture }, surface_point + Vec3::Y * half_height, Vec3::ZERO)
+                (
+                    SceneObjectKind::Flat { texture, data: FlatData::default() },
+                    surface_point + Vec3::Y * half_height,
+                    Vec3::ZERO,
+                )
             }
             Self::Light => (
                 SceneObjectKind::Light { radius: DEFAULT_LIGHT_RADIUS },
@@ -121,7 +125,7 @@ impl PaletteTab {
 
     fn label(self) -> &'static str {
         match self {
-            Self::RoomModels => "Room models",
+            Self::RoomModels => "Cell models",
             Self::AllModels => "All models",
             Self::Flats => "Flats",
             Self::Markers => "Markers",
@@ -131,9 +135,9 @@ impl PaletteTab {
 
     fn tooltip(self) -> &'static str {
         match self {
-            Self::RoomModels => "Models used in Daggerfall's dungeon rooms, most common first",
+            Self::RoomModels => "Models used in Daggerfall's dungeon cells, most common first",
             Self::AllModels => "Every model in ARCH3D.BSA",
-            Self::Flats => "Billboard sprites used in dungeon rooms: torches, furniture, people, treasure",
+            Self::Flats => "Billboard sprites used in dungeon cells: torches, furniture, people, treasure",
             Self::Markers => {
                 "Editor markers: start and enter points, enemy spawns, quest and treasure markers"
             }
@@ -301,7 +305,7 @@ impl AssetPalette {
                     ui.colored_label(hint_color, format!("Placing {asset_label} ({:.0}°)", armed.yaw_degrees));
                     ui.label(
                         egui::RichText::new(
-                            "Click in the room to place · Shift+click to keep placing · R to rotate · Esc to cancel",
+                            "Click in the cell to place · Shift+click to keep placing · R to rotate · Esc to cancel",
                         )
                         .weak(),
                     );
@@ -313,7 +317,7 @@ impl AssetPalette {
             None => {
                 ui.label(
                     egui::RichText::new(
-                        "Click an asset to start placing it in the room · right-click a model to name it",
+                        "Click an asset to start placing it in the cell · right-click a model to name it",
                     )
                     .weak(),
                 );
@@ -340,7 +344,7 @@ impl AssetPalette {
                 .filter(|model| model_matches(model.model_id))
                 .map(|model| {
                     let usage = format!(
-                        "Used in {} rooms, {} placements in total",
+                        "Used in {} cells, {} placements in total",
                         model.room_count, model.placement_count
                     );
                     entry(PlaceableAsset::Model { model_id: model.model_id }, usage)
@@ -352,8 +356,8 @@ impl AssetPalette {
                 .filter(|&&model_id| model_matches(model_id))
                 .map(|&model_id| {
                     let usage = match catalog.room_model(model_id) {
-                        Some(model) => format!("Used in {} rooms", model.room_count),
-                        None => "Not used in any dungeon room".to_string(),
+                        Some(model) => format!("Used in {} cells", model.room_count),
+                        None => "Not used in any dungeon cell".to_string(),
                     };
                     entry(PlaceableAsset::Model { model_id }, usage)
                 })
@@ -364,7 +368,7 @@ impl AssetPalette {
                     .iter()
                     .filter(|flat| matches(&flat.description()))
                     .map(|flat| {
-                        let usage = format!("{}\nUsed in {} rooms", flat.texture, flat.room_count);
+                        let usage = format!("{}\nUsed in {} cells", flat.texture, flat.room_count);
                         entry(PlaceableAsset::Flat { texture: flat.texture }, usage)
                     })
                     .collect()

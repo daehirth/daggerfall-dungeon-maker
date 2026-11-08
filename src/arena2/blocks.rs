@@ -79,6 +79,10 @@ pub struct RdbFlat {
     pub texture: TextureKey,
     /// Raw flag bits (gender for enemies, behaviour for some markers).
     pub flags: u16,
+    /// For fixed enemy markers, the enemy (in the low byte); for other flats, a faction id.
+    pub faction_or_mobile_id: u16,
+    /// Action byte; 99 makes a fixed enemy passive.
+    pub action: u8,
 }
 
 /// Light specific object data.
@@ -193,7 +197,10 @@ fn read_object_resource(
         RESOURCE_TYPE_FLAT => {
             let texture = TextureKey::from_bitfield(reader.read_u16()?);
             let flags = reader.read_u16()?;
-            RdbObjectKind::Flat(RdbFlat { texture, flags })
+            let faction_or_mobile_id = reader.read_u16()?;
+            let _next_object_offset = reader.read_i32()?;
+            let action = reader.read_u8()?;
+            RdbObjectKind::Flat(RdbFlat { texture, flags, faction_or_mobile_id, action })
         }
         RESOURCE_TYPE_LIGHT => {
             let _unknown_1 = reader.read_u32()?;

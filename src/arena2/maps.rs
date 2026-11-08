@@ -3,10 +3,17 @@
 //! `MAPS.BSA` contains four records per region. The `MAPDITEM.###` record
 //! lists every dungeon in the region together with the grid of RDB blocks it
 //! is assembled from, which is all the viewer needs to rebuild a dungeon.
+//! The dungeon's type (crypt, orc stronghold, …), which decides the enemies at
+//! its random enemy markers, is stored separately in the region's `MAPTABLE`
+//! record, one entry per location. Locations are matched up through the
+//! location ids in `MAPPITEM`, as Daggerfall Unity does.
+
+use std::collections::HashMap;
 
 use super::bsa::BsaArchive;
 use super::error::{Arena2Error, Arena2Result};
 use super::reader::ByteReader;
+use crate::encounters::DungeonType;
 
 /// Region names in the order used by the `###` suffix of `MAPS.BSA` records.
 pub const REGION_NAMES: [&str; 62] = [
@@ -90,6 +97,10 @@ const LOCATION_HEADER_SIZE: usize = 112;
 const DUNGEON_HEADER_SIZE: usize = 17;
 /// Offset of the block count within the dungeon header.
 const DUNGEON_BLOCK_COUNT_OFFSET: usize = 10;
+/// Size of one location's entry in a `MAPTABLE` record.
+const MAP_TABLE_ENTRY_SIZE: usize = 17;
+/// Offset of the dungeon type within a `MAPTABLE` entry.
+const MAP_TABLE_DUNGEON_TYPE_OFFSET: usize = 12;
 /// Location id of Orsinium, which needs a manual fix for an overlapping block.
 const ORSINIUM_LOCATION_ID: u16 = 50015;
 /// Index of the Orsinium block that the game moves, and the row it moves it to.
@@ -105,6 +116,8 @@ pub struct DungeonDefinition {
     pub region_name: &'static str,
     /// Dungeon name as shown in game.
     pub name: String,
+    /// The kind of dungeon, which decides the enemies at random enemy markers; `None` if unknown.
+    pub dungeon_type: Option<DungeonType>,
     /// Blocks making up the dungeon.
     pub blocks: Vec<DungeonBlockPlacement>,
 }
@@ -133,7 +146,13 @@ pub fn read_all_dungeons(maps_archive: &BsaArchive) -> Vec<DungeonDefinition> {
         let Some(record) = maps_archive.record_by_name(&record_name) else {
             continue;
         };
-        if let Err(error) = read_region_dungeons(region_index, region_name, record, &mut dungeons) {
+        let dungeon_types = read_dungeon_types(maps_archive, region_index).unwrap_or_else(|error| {
+            log::warn!("could not read dungeon types of region {region_index}: {error}");
+            HashMap::new()
+        });
+        if let Err(error) =
+            read_region_dungeons(region_index, region_name, record, &dungeon_types, &mut dungeons)
+        {
             log::warn!("could not read dungeons in {record_name}: {error}");
         }
     }
@@ -148,6 +167,7 @@ fn read_region_dungeons(
     region_index: usize,
     region_name: &'static str,
     record: &[u8],
+    dungeon_types: &HashMap<u16, DungeonType>,
     dungeons: &mut Vec<DungeonDefinition>,
 ) -> Arena2Result<()> {
     if record.is_empty() {
@@ -161,8 +181,10 @@ fn read_region_dungeons(
     for _ in 0..dungeon_count {
         let record_offset = offset_table.read_u32()? as usize;
         let _is_dungeon = offset_table.read_u16()?;
-        let _exterior_location_id = offset_table.read_u16()?;
-        dungeons.push(read_dungeon(region_index, region_name, record, records_start + record_offset)?);
+        let exterior_location_id = offset_table.read_u16()?;
+        let mut dungeon = read_dungeon(region_index, region_name, record, records_start + record_offset)?;
+        dungeon.dungeon_type = dungeon_types.get(&exterior_location_id).copied();
+        dungeons.push(dungeon);
     }
     Ok(())
 }
@@ -179,7 +201,7 @@ fn read_dungeon(
     let door_count = reader.read_u32()? as usize;
     let header_start = position + 4 + door_count * LOCATION_DOOR_SIZE;
 
-    let location_id = ByteReader::at(record, header_start + LOCATION_ID_OFFSET).read_u16()?;
+    let location_id = read_location_id(record, position)?;
     let name = ByteReader::at(record, header_start + LOCATION_NAME_OFFSET)
         .read_fixed_string(LOCATION_NAME_LENGTH)?;
 
@@ -218,5 +240,43 @@ fn read_dungeon(
         }
     }
 
-    Ok(DungeonDefinition { region_index, region_name, name, blocks })
+    Ok(DungeonDefinition { region_index, region_name, name, dungeon_type: None, blocks })
+}
+
+/// Reads the dungeon type of every location in a region, keyed by location id.
+///
+/// `MAPNAMES` gives the number of locations, `MAPPITEM` each location's id and
+/// `MAPTABLE` each location's dungeon type, all in the same location order.
+fn read_dungeon_types(
+    maps_archive: &BsaArchive,
+    region_index: usize,
+) -> Arena2Result<HashMap<u16, DungeonType>> {
+    let record = |kind: &str| {
+        let name = format!("{kind}.{region_index:03}");
+        maps_archive
+            .record_by_name(&name)
+            .ok_or_else(|| Arena2Error::not_found(format!("{name} in MAPS.BSA")))
+    };
+    let location_count = ByteReader::new(record("MAPNAMES")?).read_u32()? as usize;
+    let locations = record("MAPPITEM")?;
+    let map_table = record("MAPTABLE")?;
+
+    let mut dungeon_types = HashMap::new();
+    let mut offset_table = ByteReader::new(locations);
+    for location_index in 0..location_count {
+        let location_start = location_count * 4 + offset_table.read_u32()? as usize;
+        let location_id = read_location_id(locations, location_start)?;
+        let type_position = location_index * MAP_TABLE_ENTRY_SIZE + MAP_TABLE_DUNGEON_TYPE_OFFSET;
+        let raw_type = ByteReader::at(map_table, type_position).read_u8()?;
+        if let Some(dungeon_type) = DungeonType::from_raw(raw_type) {
+            dungeon_types.insert(location_id, dungeon_type);
+        }
+    }
+    Ok(dungeon_types)
+}
+
+/// Reads the id of the location record starting at `position`: past its door list, in its header.
+fn read_location_id(record: &[u8], position: usize) -> Arena2Result<u16> {
+    let door_count = ByteReader::at(record, position).read_u32()? as usize;
+    ByteReader::at(record, position + 4 + door_count * LOCATION_DOOR_SIZE + LOCATION_ID_OFFSET).read_u16()
 }

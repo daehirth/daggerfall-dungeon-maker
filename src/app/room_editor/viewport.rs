@@ -5,7 +5,7 @@ use eframe::egui;
 use glam::{Vec2, Vec3};
 
 use super::history::SceneEdit;
-use super::panels::object_display_name;
+use super::panels::{object_display_name, percent};
 use super::RoomEditor;
 use crate::app::viewport_tools::{
     aspect_ratio, handle_camera_input, paint_scene, size_in_pixels, EditorResources, ViewportProjection,
@@ -38,6 +38,15 @@ impl GizmoAxis {
             Self::X => Vec3::X,
             Self::Y => Vec3::Y,
             Self::Z => Vec3::Z,
+        }
+    }
+
+    /// Index of the axis's component in a `Vec3`.
+    fn component(self) -> usize {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+            Self::Z => 2,
         }
     }
 
@@ -114,6 +123,7 @@ impl RoomEditor {
             room_outlines: &ROOM_OUTLINE,
             settings: &self.view_settings,
             grid_height: self.grid_height,
+            snap_grid_spacing: self.snap.enabled.then_some(self.snap.step),
             size_in_pixels: size_in_pixels(ui, rect),
         };
         paint_scene(ui, rect, resources, &mut self.target, &request);
@@ -181,7 +191,8 @@ impl RoomEditor {
 
         // Begin a drag on an arrow.
         if response.drag_started_by(egui::PointerButton::Primary) {
-            if let (Some(axis), Some(object_index)) = (self.viewport.hovered_axis, self.selected_object) {
+            let grabbed = self.viewport.hovered_axis.zip(self.selected_object);
+            if let Some((axis, object_index)) = grabbed.filter(|_| self.can_edit()) {
                 if let Some(object) = self.scene.objects.get(object_index) {
                     self.history.record(SceneEdit::Replace { index: object_index, object: object.clone() });
                     self.viewport.gizmo_drag = Some(GizmoDrag {
@@ -205,15 +216,17 @@ impl RoomEditor {
                         drag.distance_along_axis += along * handle.world_length;
                     }
                 }
+                // With grid lock on (or Ctrl held while it is off) the position along the
+                // dragged axis lands on the snap grid itself, not just whole steps from the start.
                 let invert_snap = ui.input(|input| input.modifiers.command);
                 let snapping = self.snap.enabled != invert_snap;
-                let offset = if snapping && self.snap.step > 0.0 {
-                    (drag.distance_along_axis / self.snap.step).round() * self.snap.step
-                } else {
-                    drag.distance_along_axis
-                };
+                let mut position = drag.start_position + drag.axis.direction() * drag.distance_along_axis;
+                if snapping && self.snap.step > 0.0 {
+                    let component = &mut position[drag.axis.component()];
+                    *component = (*component / self.snap.step).round() * self.snap.step;
+                }
                 if let Some(object) = self.scene.objects.get_mut(drag.object_index) {
-                    object.position = drag.start_position + drag.axis.direction() * offset;
+                    object.position = position;
                 }
                 self.viewport.gizmo_drag = Some(drag);
             }
@@ -309,6 +322,11 @@ impl RoomEditor {
             return;
         }
         let Some(object) = self.viewport.placement_preview.clone() else { return };
+        if !self.can_edit() {
+            self.palette.armed = None;
+            self.viewport.placement_preview = None;
+            return;
+        }
         let new_index = self.scene.objects.len();
         self.scene.objects.push(object);
         if let Some(description) = self.describe_object(new_index, resources) {
@@ -376,7 +394,22 @@ impl RoomEditor {
         let (Some(index), Some(pointer)) = (self.viewport.hovered_object, response.hover_pos()) else {
             return;
         };
-        if let Some(description) = self.describe_object(index, resources) {
+        if let Some(mut description) = self.describe_object(index, resources) {
+            if let Some(fixed_enemy) = self.scene.objects[index].fixed_enemy() {
+                description = format!("{description}\nSpawns: {}", fixed_enemy.description());
+            }
+            // A random enemy marker also shows its likeliest enemies in this dungeon.
+            let possible_enemies =
+                self.possible_enemies(index).filter(|_| self.scene.objects[index].is_random_enemy_marker());
+            if let Some(possible_enemies) = possible_enemies {
+                let likeliest: Vec<String> = possible_enemies
+                    .iter()
+                    .take(3)
+                    .map(|chance| format!("{} {}", chance.enemy.name(), percent(chance.chance)))
+                    .collect();
+                description =
+                    format!("{description}\nLevel {}: {}", self.enemy_preview_level, likeliest.join(", "));
+            }
             painter.text(
                 pointer + egui::vec2(14.0, 14.0),
                 egui::Align2::LEFT_TOP,

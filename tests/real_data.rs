@@ -48,6 +48,90 @@ fn lists_dungeons_whose_blocks_all_exist() {
 }
 
 #[test]
+fn dungeons_have_types() {
+    let Some(mut library) = open_library() else { return };
+
+    let dungeons = library.dungeons();
+    let typed = dungeons.iter().filter(|dungeon| dungeon.dungeon_type.is_some()).count();
+    println!("{typed} of {} dungeons have a type", dungeons.len());
+    assert!(typed * 100 >= dungeons.len() * 99, "most dungeons should have a type");
+    for dungeon_type in daggerfall_dungeon_maker::encounters::DungeonType::all() {
+        let examples: Vec<&str> = dungeons
+            .iter()
+            .filter(|dungeon| dungeon.dungeon_type == Some(dungeon_type))
+            .map(|dungeon| dungeon.name.as_str())
+            .take(3)
+            .collect();
+        println!("{}: {}", dungeon_type.name(), examples.join(", "));
+        assert!(!examples.is_empty(), "no dungeon is a {}", dungeon_type.name());
+    }
+}
+
+#[test]
+fn fixed_enemy_markers_name_known_enemies() {
+    let Some(library) = open_library() else { return };
+
+    let mut markers = Vec::new();
+    for name in library.rdb_block_names() {
+        let block = library.rdb_block(&name).expect("block should parse");
+        let scene = daggerfall_dungeon_maker::scene::Scene::from_rdb_block(&block);
+        markers.extend(
+            scene.objects.iter().filter_map(|object| object.fixed_enemy()).map(|enemy| (name.clone(), enemy)),
+        );
+    }
+    let unknown: Vec<_> = markers
+        .iter()
+        .filter(|(_, enemy)| enemy.enemy().is_none() && !enemy.is_switched_off())
+        .map(|(name, enemy)| format!("{name}: {}", enemy.mobile_id))
+        .collect();
+    println!("{} fixed enemy markers, {} name an unknown enemy", markers.len(), unknown.len());
+    for (name, enemy) in markers.iter().take(8) {
+        println!(
+            "  {name}: {} (passive: {}, gender: {:?})",
+            enemy.description(),
+            enemy.passive,
+            enemy.human_gender()
+        );
+    }
+    assert!(!markers.is_empty());
+    assert!(unknown.is_empty(), "unknown enemies: {unknown:?}");
+}
+
+#[test]
+fn water_cells_have_underwater_enemy_markers() {
+    let Some(library) = open_library() else { return };
+
+    let mut cells_with_water = Vec::new();
+    let mut underwater_markers = 0;
+    let mut random_markers = 0;
+    for name in library.rdb_block_names() {
+        let block = library.rdb_block(&name).expect("block should parse");
+        let scene = daggerfall_dungeon_maker::scene::Scene::from_rdb_block(&block);
+        let markers: Vec<_> = scene.objects.iter().filter(|object| object.is_random_enemy_marker()).collect();
+        random_markers += markers.len();
+        if let Some(level) = scene.water_level() {
+            let under = markers.iter().filter(|marker| scene.is_under_water(marker)).count();
+            underwater_markers += under;
+            cells_with_water.push(format!(
+                "{name} (water at {level:.1} m, {under} of {} random markers under)",
+                markers.len()
+            ));
+        }
+    }
+    println!(
+        "{} cells have water; {underwater_markers} of {random_markers} random enemy markers are under it",
+        cells_with_water.len()
+    );
+    for cell in cells_with_water.iter().take(6) {
+        println!("  {cell}");
+    }
+    assert!(!cells_with_water.is_empty());
+    assert!(underwater_markers > 0);
+    // Water cells are the "W" interiors.
+    assert!(cells_with_water.iter().any(|cell| cell.starts_with('W')));
+}
+
+#[test]
 fn parses_every_rdb_block_and_its_models() {
     let Some(mut library) = open_library() else { return };
 

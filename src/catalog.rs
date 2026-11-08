@@ -95,7 +95,7 @@ impl ModelCategory {
             Self::DungeonEntrance => "Dungeon entrance",
             Self::Door => "Door",
             Self::MovingPart => "Moving part",
-            Self::RoomPiece => "Room piece",
+            Self::RoomPiece => "Cell piece",
             Self::Object => "Object",
         }
     }

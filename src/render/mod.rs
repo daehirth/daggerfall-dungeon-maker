@@ -109,6 +109,8 @@ pub struct FrameRequest<'frame> {
     pub settings: &'frame ViewSettings,
     /// Height of the floor grid in world units.
     pub grid_height: f32,
+    /// Spacing of extra, fainter grid lines showing where objects snap to; `None` draws none.
+    pub snap_grid_spacing: Option<f32>,
     /// Viewport size in physical pixels.
     pub size_in_pixels: [u32; 2],
 }
@@ -516,7 +518,7 @@ impl SceneRenderer {
                         highlight,
                     });
                 }
-                SceneObjectKind::Flat { texture } => {
+                SceneObjectKind::Flat { texture, .. } => {
                     let shown = if object.is_marker() { settings.show_markers } else { settings.show_flats };
                     if !shown {
                         continue;
@@ -615,7 +617,7 @@ fn build_helper_lines(library: &mut Arena2Library, request: &FrameRequest<'_>) -
     let grid_height = request.grid_height;
 
     if settings.show_grid {
-        add_grid(&mut lines, request.room_outlines, grid_height);
+        add_grid(&mut lines, request.room_outlines, grid_height, request.snap_grid_spacing);
     }
 
     if settings.show_room_outline {
@@ -688,8 +690,17 @@ fn build_helper_lines(library: &mut Arena2Library, request: &FrameRequest<'_>) -
 }
 
 /// Adds a floor grid that covers every room outline (or one block at the origin) plus a margin.
-fn add_grid(lines: &mut LineBatch, room_outlines: &[RoomOutline], grid_height: f32) {
+///
+/// With `snap_spacing`, fainter lines are added between the main ones at that
+/// spacing, showing where objects snap to.
+fn add_grid(
+    lines: &mut LineBatch,
+    room_outlines: &[RoomOutline],
+    grid_height: f32,
+    snap_spacing: Option<f32>,
+) {
     let grid_color = Vec4::new(0.12, 0.13, 0.15, 1.0);
+    let snap_grid_color = Vec4::new(0.165, 0.175, 0.2, 1.0);
     let margin = GRID_MARGIN_CELLS as f32 * GRID_SPACING;
 
     let (minimum_corner, maximum_corner) = room_outlines
@@ -703,6 +714,38 @@ fn add_grid(lines: &mut LineBatch, room_outlines: &[RoomOutline], grid_height: f
     let (first_row, last_row) = (snap_down(minimum_corner.z), snap_up(maximum_corner.z));
     let (minimum_x, maximum_x) = (first_column as f32 * GRID_SPACING, last_column as f32 * GRID_SPACING);
     let (minimum_z, maximum_z) = (first_row as f32 * GRID_SPACING, last_row as f32 * GRID_SPACING);
+
+    // Snap lines first, skipping those that fall on a main line, so the main lines stay on top.
+    if let Some(spacing) = snap_spacing.filter(|spacing| *spacing > 0.0 && *spacing < GRID_SPACING) {
+        let on_main_line = |value: f32| {
+            let cells = value / GRID_SPACING;
+            (cells - cells.round()).abs() < 1e-3
+        };
+        let first_x = (minimum_x / spacing).ceil() as i32;
+        let last_x = (maximum_x / spacing).floor() as i32;
+        for index in first_x..=last_x {
+            let x = index as f32 * spacing;
+            if !on_main_line(x) {
+                lines.add_line(
+                    Vec3::new(x, grid_height, minimum_z),
+                    Vec3::new(x, grid_height, maximum_z),
+                    snap_grid_color,
+                );
+            }
+        }
+        let first_z = (minimum_z / spacing).ceil() as i32;
+        let last_z = (maximum_z / spacing).floor() as i32;
+        for index in first_z..=last_z {
+            let z = index as f32 * spacing;
+            if !on_main_line(z) {
+                lines.add_line(
+                    Vec3::new(minimum_x, grid_height, z),
+                    Vec3::new(maximum_x, grid_height, z),
+                    snap_grid_color,
+                );
+            }
+        }
+    }
 
     for column in first_column..=last_column {
         let x = column as f32 * GRID_SPACING;

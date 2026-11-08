@@ -65,7 +65,7 @@ pub fn pick_object(
             SceneObjectKind::Model { model_id, .. } if options.include_models => {
                 intersect_model(object, model_id, library, ray, options.ignore_back_faces)
             }
-            SceneObjectKind::Flat { texture } if options.include_flats => {
+            SceneObjectKind::Flat { texture, .. } if options.include_flats => {
                 let size = library.billboard_world_size(texture).unwrap_or(Vec2::ONE);
                 intersect_billboard(ray, object.position, size, options.camera_right)
             }
