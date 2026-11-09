@@ -13,6 +13,9 @@
 //! dungeon. Each such room belongs to one dungeon: duplicating the dungeon
 //! duplicates its rooms too, so editing a room never changes another dungeon.
 //!
+//! A dungeon also has a [`DungeonLocation`]: where it goes on the world map
+//! and how it appears there, so it can be added to the game as a new location.
+//!
 //! The file is JSON. Rooms keep their id in the file so dungeons can refer to them.
 
 use std::path::Path;
@@ -20,8 +23,9 @@ use std::path::Path;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
-use crate::arena2::{DungeonDefinition, TextureKey};
+use crate::arena2::{region_name, DungeonDefinition, LocationType, MapPixel, TextureKey, WorldMap};
 use crate::encounters::DungeonType;
+use crate::music::DungeonSong;
 use crate::scene::{
     FlatData, LightData, ModelData, ObjectAction, ObjectId, Scene, SceneObject, SceneObjectKind,
     ADDED_OBJECTS_GROUP,
@@ -62,8 +66,139 @@ pub struct ProjectDungeon {
     /// The Daggerfall dungeon this one was copied from.
     pub based_on: Option<String>,
     pub rooms: Vec<ProjectDungeonRoom>,
+    /// Where the dungeon goes in the world when it is added to the game.
+    pub location: DungeonLocation,
 }
 
+/// Where a project dungeon goes in the world, as a new location of its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DungeonLocation {
+    /// Its spot on the world map, or `None` until the user places it. The
+    /// dungeon belongs to the region of that spot.
+    pub map_pixel: Option<MapPixel>,
+    /// Its icon on the travel map (large dungeon, graveyard, …).
+    pub location_type: LocationType,
+    /// Whether the travel map shows it from the start of the game, before the
+    /// player hears of it.
+    pub discovered: bool,
+    /// The Daggerfall dungeon whose above-ground part (the ruin or building
+    /// around the way down) this dungeon uses, or `None` if not chosen yet.
+    pub entrance: Option<DungeonReference>,
+    /// The Daggerfall dungeon this one takes the place of, at its spot on the
+    /// map; `None` for a new location of its own.
+    pub replaces: Option<DungeonReference>,
+    /// The song played inside; `None` leaves the choice to the game (for a
+    /// replacement, the song the replaced dungeon has).
+    pub music: Option<DungeonSong>,
+    /// Whether the dungeon plays its own music file ([`Self::custom_music_file`])
+    /// instead of a game song. Only a `.dfmod` can do that (it carries a
+    /// script that plays it); loose files fall back to [`Self::music`].
+    pub custom_music: bool,
+    /// The music file (`.ogg` or `.mp3`) the dungeon plays with [`Self::custom_music`].
+    pub custom_music_file: String,
+}
+
+/// Extensions of the music files a dungeon can play as custom music.
+pub const CUSTOM_MUSIC_EXTENSIONS: [&str; 2] = ["ogg", "mp3"];
+
+impl Default for DungeonLocation {
+    fn default() -> Self {
+        Self {
+            map_pixel: None,
+            location_type: LocationType::MediumDungeon,
+            discovered: false,
+            entrance: None,
+            replaces: None,
+            music: None,
+            custom_music: false,
+            custom_music_file: String::new(),
+        }
+    }
+}
+
+/// Names one of Daggerfall's own dungeons. (Several regions have dungeons of the same name.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DungeonReference {
+    pub region_index: usize,
+    pub name: String,
+}
+
+impl DungeonReference {
+    /// Refers to `definition`.
+    pub fn to(definition: &DungeonDefinition) -> Self {
+        Self { region_index: definition.region_index, name: definition.name.clone() }
+    }
+
+    /// Whether this refers to `definition`.
+    pub fn is(&self, definition: &DungeonDefinition) -> bool {
+        self.region_index == definition.region_index && self.name == definition.name
+    }
+
+    /// The name and region, for example "Privateer's Hold (Daggerfall)".
+    pub fn label(&self) -> String {
+        format!("{} ({})", self.name, region_name(self.region_index))
+    }
+}
+
+impl DungeonLocation {
+    /// The location of a copy of `definition`: the same kind of location with
+    /// the same entrance, not yet placed (the original's spot is taken).
+    pub fn copied_from(definition: &DungeonDefinition) -> Self {
+        Self {
+            map_pixel: None,
+            location_type: definition
+                .location_type
+                .filter(|location_type| LocationType::DUNGEON_TYPES.contains(location_type))
+                .unwrap_or(LocationType::MediumDungeon),
+            discovered: false,
+            entrance: Some(DungeonReference::to(definition)),
+            replaces: None,
+            music: None,
+            custom_music: false,
+            custom_music_file: String::new(),
+        }
+    }
+
+    /// What stops the dungeon from being added to the game at this location.
+    ///
+    /// `other_dungeons` are the project's other placed dungeons, by name. The
+    /// spot must be on the map, in a region (not the sea) and free: Daggerfall
+    /// Unity finds locations by their map pixel, so two cannot share one. A
+    /// dungeon that replaces a Daggerfall dungeon takes that dungeon's spot.
+    pub fn problems(&self, world: Option<&WorldMap>, other_dungeons: &[(&str, MapPixel)]) -> Vec<String> {
+        let mut problems = Vec::new();
+        match self.map_pixel {
+            None => problems.push("It is not placed on the world map yet".to_string()),
+            Some(pixel) if !pixel.is_on_map() => problems.push(format!("{pixel} is off the world map")),
+            Some(pixel) => {
+                if let Some(world) = world {
+                    if world.has_regions() && world.region_at(pixel).is_none() && self.replaces.is_none() {
+                        problems.push("Its spot is in the sea, outside every region".to_string());
+                    }
+                    let replaced = |location: &&crate::arena2::WorldLocation| {
+                        self.replaces.as_ref().is_some_and(|replaced| {
+                            replaced.region_index == location.region_index && replaced.name == location.name
+                        })
+                    };
+                    for location in world.locations_at(pixel).filter(|location| !replaced(location)) {
+                        problems.push(format!(
+                            "Daggerfall's {} ({}) is already at its spot",
+                            location.name,
+                            region_name(location.region_index)
+                        ));
+                    }
+                }
+                for (name, _) in other_dungeons.iter().filter(|(_, other)| *other == pixel) {
+                    problems.push(format!("{name}, in this project, is already at its spot"));
+                }
+            }
+        }
+        if self.entrance.is_none() {
+            problems.push("No entrance is chosen".to_string());
+        }
+        problems
+    }
+}
 /// One room placed in a project dungeon.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectDungeonRoom {
@@ -159,7 +294,32 @@ pub struct FolderListing {
 pub struct Project {
     /// Top-level entries: folders and loose rooms and dungeons, in display order.
     pub entries: Vec<ProjectEntry>,
+    /// How the project is described when exported as a Daggerfall Unity mod.
+    pub mod_details: ModDetails,
     next_id: ItemId,
+}
+
+/// What a Daggerfall Unity mod made from the project says about itself, in
+/// its manifest. Saved with the project.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModDetails {
+    /// Name shown in Daggerfall Unity's mod list; the project's name when empty.
+    pub title: String,
+    pub version: String,
+    pub author: String,
+    /// Where players can reach the author (a web page, an e-mail address, …).
+    pub contact: String,
+    pub description: String,
+    /// Identifies the mod to Daggerfall Unity; made once, on the first export.
+    pub guid: String,
+}
+
+impl ModDetails {
+    /// Whether nothing has been filled in.
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Project {
@@ -324,6 +484,39 @@ impl Project {
             .expect("an unused name always exists")
     }
 
+    /// Whether a room or dungeon of the project is called `name` (ignoring case
+    /// and surrounding spaces).
+    pub fn has_item_named(&self, name: &str) -> bool {
+        let mut names = Vec::new();
+        collect_item_names(&self.entries, &mut names);
+        let name = name.trim();
+        names.iter().any(|existing| existing.trim().eq_ignore_ascii_case(name))
+    }
+
+    /// Adds an empty room called `name` at the top level and returns its id.
+    pub fn add_empty_room(&mut self, name: &str) -> ItemId {
+        let id = self.new_id();
+        let room = ProjectRoom { id, name: name.trim().to_string(), based_on: None, objects: Vec::new() };
+        self.add(ProjectEntry::Room(room), None);
+        id
+    }
+
+    /// Adds an empty dungeon (no cells, not placed) called `name` at the top level and returns its id.
+    pub fn add_empty_dungeon(&mut self, name: &str) -> ItemId {
+        let id = self.new_id();
+        let dungeon = ProjectDungeon {
+            id,
+            name: name.trim().to_string(),
+            region_name: String::new(),
+            dungeon_type: None,
+            based_on: None,
+            rooms: Vec::new(),
+            location: DungeonLocation::default(),
+        };
+        self.add(ProjectEntry::Dungeon(dungeon), None);
+        id
+    }
+
     /// Copies the room or dungeon `id` and adds the copy just after it. Returns the copy's id.
     ///
     /// A dungeon's project rooms are copied too (at the top level), so the
@@ -336,6 +529,9 @@ impl Project {
             ProjectEntry::Room(room) => room.id = copy_id,
             ProjectEntry::Dungeon(dungeon) => {
                 dungeon.id = copy_id;
+                // Two dungeons cannot share a spot on the map.
+                dungeon.location.map_pixel = None;
+                dungeon.location.replaces = None;
                 for placement in &mut dungeon.rooms {
                     let Some(mut room) = placement.room.and_then(|room_id| self.room(room_id)).cloned()
                     else {
@@ -360,6 +556,15 @@ impl Project {
         let mut dungeons = Vec::new();
         collect_dungeons(&self.entries, &mut dungeons);
         dungeons
+    }
+
+    /// The name and map spot of every placed project dungeon except `except`.
+    pub fn placed_dungeons(&self, except: Option<ItemId>) -> Vec<(&str, MapPixel)> {
+        self.dungeons()
+            .into_iter()
+            .filter(|dungeon| Some(dungeon.id) != except)
+            .filter_map(|dungeon| Some((dungeon.name.as_str(), dungeon.location.map_pixel?)))
+            .collect()
     }
 
     /// Names of the dungeons that use the project room `room_id`.
@@ -390,6 +595,7 @@ impl Project {
             format: FORMAT_NAME.to_string(),
             version: FORMAT_VERSION,
             entries: self.entries.iter().map(EntryFile::from_entry).collect(),
+            mod_details: (!self.mod_details.is_empty()).then(|| self.mod_details.clone()),
         };
         serde_json::to_string_pretty(&file).expect("project data always serialises")
     }
@@ -408,6 +614,7 @@ impl Project {
         // Rooms keep their saved ids; everything else is numbered after them.
         project.next_id = file.entries.iter().map(EntryFile::largest_room_id).max().unwrap_or(0);
         project.entries = file.entries.into_iter().map(|entry| entry.into_entry(&mut project)).collect();
+        project.mod_details = file.mod_details.unwrap_or_default();
         // A dungeon whose room is missing from the file falls back to the Daggerfall room.
         let mut room_ids = Vec::new();
         collect_room_ids(&project.entries, &mut room_ids);
@@ -560,6 +767,9 @@ struct ProjectFile {
     format: String,
     version: u32,
     entries: Vec<EntryFile>,
+    /// Absent until the project is described for export.
+    #[serde(default, rename = "mod", skip_serializing_if = "Option::is_none")]
+    mod_details: Option<ModDetails>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -588,7 +798,81 @@ enum EntryFile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         based_on: Option<String>,
         rooms: Vec<DungeonRoomFile>,
+        /// Absent in files saved before dungeons had a location.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<LocationFile>,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+struct LocationFile {
+    /// Map pixel `[x, y]`; absent until the dungeon is placed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    map_pixel: Option<[i32; 2]>,
+    /// The Daggerfall dungeon it replaces; absent for a new location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replaces: Option<DungeonReferenceFile>,
+    /// The song played inside, by Daggerfall Unity's name (for example
+    /// "dungeon5"); absent when the game chooses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    music: Option<String>,
+    /// Whether the dungeon plays its own music file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    custom_music: bool,
+    /// The music file it plays; absent when none was chosen.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    custom_music_file: String,
+    /// Location type name, for example "Large dungeon".
+    location_type: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    discovered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entrance: Option<DungeonReferenceFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DungeonReferenceFile {
+    region: usize,
+    name: String,
+}
+
+impl LocationFile {
+    fn from_location(location: &DungeonLocation) -> Self {
+        Self {
+            map_pixel: location.map_pixel.map(|pixel| [pixel.x, pixel.y]),
+            location_type: location.location_type.name().to_string(),
+            discovered: location.discovered,
+            entrance: location.entrance.as_ref().map(|entrance| DungeonReferenceFile {
+                region: entrance.region_index,
+                name: entrance.name.clone(),
+            }),
+            replaces: location.replaces.as_ref().map(|replaced| DungeonReferenceFile {
+                region: replaced.region_index,
+                name: replaced.name.clone(),
+            }),
+            music: location.music.map(|song| song.name.to_string()),
+            custom_music: location.custom_music,
+            custom_music_file: location.custom_music_file.clone(),
+        }
+    }
+
+    fn into_location(self) -> DungeonLocation {
+        DungeonLocation {
+            map_pixel: self.map_pixel.map(|[x, y]| MapPixel::new(x, y)),
+            location_type: LocationType::from_name(&self.location_type)
+                .unwrap_or(DungeonLocation::default().location_type),
+            discovered: self.discovered,
+            entrance: self
+                .entrance
+                .map(|entrance| DungeonReference { region_index: entrance.region, name: entrance.name }),
+            replaces: self
+                .replaces
+                .map(|replaced| DungeonReference { region_index: replaced.region, name: replaced.name }),
+            music: self.music.as_deref().and_then(DungeonSong::from_name),
+            custom_music: self.custom_music,
+            custom_music_file: self.custom_music_file,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -711,6 +995,7 @@ impl EntryFile {
                         room: room.room,
                     })
                     .collect(),
+                location: Some(LocationFile::from_location(&dungeon.location)),
             },
         }
     }
@@ -743,7 +1028,7 @@ impl EntryFile {
                     objects
                 },
             }),
-            Self::Dungeon { name, region, dungeon_type, based_on, rooms } => {
+            Self::Dungeon { name, region, dungeon_type, based_on, rooms, location } => {
                 ProjectEntry::Dungeon(ProjectDungeon {
                     id: project.new_id(),
                     name,
@@ -760,6 +1045,7 @@ impl EntryFile {
                             room: room.room,
                         })
                         .collect(),
+                    location: location.map(LocationFile::into_location).unwrap_or_default(),
                 })
             }
         }
@@ -932,6 +1218,22 @@ mod tests {
                         room: Some(dungeon_room_id),
                     },
                 ],
+                location: DungeonLocation {
+                    map_pixel: Some(MapPixel::new(204, 312)),
+                    location_type: LocationType::Graveyard,
+                    discovered: true,
+                    entrance: Some(DungeonReference {
+                        region_index: 17,
+                        name: "Privateer's Hold".to_string(),
+                    }),
+                    replaces: Some(DungeonReference {
+                        region_index: 17,
+                        name: "Castle Necromoghan".to_string(),
+                    }),
+                    music: Some(crate::music::DUNGEON_SONGS[3]),
+                    custom_music: true,
+                    custom_music_file: "C:/Music/Hold.ogg".to_string(),
+                },
             }),
             None,
         );
@@ -941,6 +1243,20 @@ mod tests {
         assert_eq!(loaded.to_file_text(), text);
         let loaded_dungeon = loaded.dungeon(loaded.entries[2].id()).unwrap();
         assert_eq!(loaded_dungeon.dungeon_type, DungeonType::from_name("Human Stronghold"));
+        assert_eq!(loaded_dungeon.location.map_pixel, Some(MapPixel::new(204, 312)));
+        assert_eq!(loaded_dungeon.location.location_type, LocationType::Graveyard);
+        assert!(loaded_dungeon.location.discovered);
+        assert_eq!(loaded_dungeon.location.music, Some(crate::music::DUNGEON_SONGS[3]));
+        assert!(loaded_dungeon.location.custom_music);
+        assert_eq!(loaded_dungeon.location.custom_music_file, "C:/Music/Hold.ogg");
+        assert_eq!(
+            loaded_dungeon.location.replaces.as_ref().map(DungeonReference::label).as_deref(),
+            Some("Castle Necromoghan (Daggerfall)")
+        );
+        assert_eq!(
+            loaded_dungeon.location.entrance.as_ref().unwrap().label(),
+            "Privateer's Hold (Daggerfall)"
+        );
         let room_id = loaded_dungeon.rooms[1].room.expect("the dungeon still uses its room");
         assert_eq!(loaded.room(room_id).unwrap().name, "B0000002-Copy");
         assert_eq!(loaded.dungeons_using(room_id), ["Privateer's Hold-Copy"]);
@@ -972,12 +1288,19 @@ mod tests {
                     is_starting_block: true,
                     room: Some(room_id),
                 }],
+                location: DungeonLocation {
+                    map_pixel: Some(MapPixel::new(5, 6)),
+                    ..DungeonLocation::default()
+                },
             }),
             None,
         );
 
-        // A duplicated dungeon gets its own copy of the room.
+        // A duplicated dungeon gets its own copy of the room, and is not placed on the original's spot.
         let copy_id = project.duplicate(dungeon_id).unwrap();
+        assert_eq!(project.dungeon(copy_id).unwrap().location.map_pixel, None);
+        assert_eq!(project.placed_dungeons(None), [("Hold", MapPixel::new(5, 6))]);
+        assert!(project.placed_dungeons(Some(dungeon_id)).is_empty());
         let copied_room = project.dungeon(copy_id).unwrap().rooms[0].room.unwrap();
         assert_ne!(copied_room, room_id);
         assert_eq!(project.room(copied_room).unwrap().name, "S0000999-Copy-Copy");
@@ -990,6 +1313,51 @@ mod tests {
         let loaded = Project::from_file_text(&project.to_file_text()).unwrap();
         let loaded_copy = loaded.entries.iter().find(|entry| entry.name() == "Hold-Copy").unwrap();
         assert_eq!(loaded.dungeon(loaded_copy.id()).unwrap().rooms[0].room, None);
+    }
+
+    #[test]
+    fn older_files_load_dungeons_without_a_location() {
+        let text = format!(
+            r#"{{"format":"{FORMAT_NAME}","version":1,"entries":[
+                {{"type":"dungeon","name":"Old","region":"Daggerfall","rooms":[]}}]}}"#
+        );
+        let loaded = Project::from_file_text(&text).unwrap();
+        assert_eq!(loaded.dungeons()[0].location, DungeonLocation::default());
+    }
+
+    #[test]
+    fn location_problems() {
+        let mut location = DungeonLocation::default();
+        assert_eq!(
+            location.problems(None, &[]),
+            ["It is not placed on the world map yet", "No entrance is chosen"]
+        );
+
+        location.entrance = Some(DungeonReference { region_index: 17, name: "Privateer's Hold".to_string() });
+        location.map_pixel = Some(MapPixel::new(1000, 3));
+        assert_eq!(location.problems(None, &[]), ["1000, 3 is off the world map"]);
+
+        location.map_pixel = Some(MapPixel::new(10, 3));
+        assert!(location.problems(None, &[("Other", MapPixel::new(10, 4))]).is_empty());
+        assert_eq!(
+            location.problems(None, &[("Other", MapPixel::new(10, 3))]),
+            ["Other, in this project, is already at its spot"]
+        );
+    }
+
+    #[test]
+    fn empty_items_and_taken_names() {
+        let mut project = Project::default();
+        let room_id = project.add_empty_room(" Great Hall ");
+        let dungeon_id = project.add_empty_dungeon("Deep Vault");
+        assert_eq!(project.room(room_id).unwrap().name, "Great Hall");
+        assert!(project.room(room_id).unwrap().objects.is_empty());
+        let dungeon = project.dungeon(dungeon_id).unwrap();
+        assert!(dungeon.rooms.is_empty());
+        assert_eq!(dungeon.location, DungeonLocation::default());
+        assert!(project.has_item_named("great hall"));
+        assert!(project.has_item_named("DEEP VAULT "));
+        assert!(!project.has_item_named("Deep"));
     }
 
     #[test]

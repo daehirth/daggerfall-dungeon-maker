@@ -1,18 +1,20 @@
 //! Owns the loaded Daggerfall archives and caches decoded assets.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use glam::Vec2;
 
-use super::blocks::{parse_rdb_block, RdbBlock};
+use super::blocks::{parse_rdb_block, read_model_tags, RdbBlock};
 use super::bsa::BsaArchive;
 use super::error::{read_file, Arena2Error, Arena2Result};
-use super::maps::{read_all_dungeons, DungeonDefinition};
+use super::maps::{read_all_dungeons, read_all_location_ids, DungeonDefinition};
 use super::mesh::{parse_model, ModelMesh};
+use super::rmb::{parse_rmb_block, RmbBlock};
 use super::texture::{read_archive_name, Palette, RgbaImage, TextureArchive, ARCHIVE_HEADER_SIZE};
+use super::world::WorldMap;
 use super::{TextureKey, WORLD_SCALE};
 
 /// Archive holding every 3D model.
@@ -21,6 +23,12 @@ const MODELS_FILE: &str = "ARCH3D.BSA";
 const BLOCKS_FILE: &str = "BLOCKS.BSA";
 /// Archive holding region, location and dungeon layout data. Optional: only needed to open dungeons.
 const MAPS_FILE: &str = "MAPS.BSA";
+/// Region of every world map pixel. Optional: without it, regions are not shown on the map.
+const POLITIC_FILE: &str = "POLITIC.PAK";
+/// Daggerfall's music, as HMI songs. Optional: only needed to preview music.
+const MIDI_FILE: &str = "MIDI.BSA";
+/// Climate of every world map pixel. Optional: only needed to export new locations.
+const CLIMATE_FILE: &str = "CLIMATE.PAK";
 /// Palette used by all `TEXTURE.###` files.
 const TEXTURE_PALETTE_FILE: &str = "ART_PAL.COL";
 
@@ -49,6 +57,8 @@ pub struct Arena2Library {
     /// Names from texture archive headers; read separately so naming does not load whole archives.
     texture_archive_name_cache: HashMap<u16, Option<String>>,
     dungeon_cache: Option<Arc<[DungeonDefinition]>>,
+    world_map_cache: Option<Arc<WorldMap>>,
+    model_tag_cache: Option<Arc<HashMap<u32, String>>>,
 }
 
 impl Arena2Library {
@@ -106,6 +116,8 @@ impl Arena2Library {
             texture_archive_cache: HashMap::new(),
             texture_archive_name_cache: HashMap::new(),
             dungeon_cache: None,
+            world_map_cache: None,
+            model_tag_cache: None,
         })
     }
 
@@ -122,6 +134,20 @@ impl Arena2Library {
         self.dungeon_cache
             .get_or_insert_with(|| maps_archive.as_ref().map(read_all_dungeons).unwrap_or_default().into())
             .clone()
+    }
+
+    /// Returns the world map: every location and the region of each map pixel.
+    ///
+    /// Read on first use and cached. `None` if `MAPS.BSA` is missing.
+    pub fn world_map(&mut self) -> Option<Arc<WorldMap>> {
+        if self.world_map_cache.is_none() {
+            let maps_archive = self.maps_archive.as_ref()?;
+            let politic = self.files_by_name.get(POLITIC_FILE).and_then(|path| read_file(path).ok());
+            let climate = self.files_by_name.get(CLIMATE_FILE).and_then(|path| read_file(path).ok());
+            self.world_map_cache =
+                Some(Arc::new(WorldMap::read(maps_archive, politic.as_deref(), climate.as_deref())));
+        }
+        self.world_map_cache.clone()
     }
 
     /// The `ARENA2` folder this library was loaded from.
@@ -220,6 +246,63 @@ impl Arena2Library {
         names
     }
 
+    /// The three letter tag Daggerfall's own cells give each model (for
+    /// example `DOR` for doors that open), the most common one where cells
+    /// differ. Read from every RDB block on first use and cached.
+    pub fn model_tags(&mut self) -> Arc<HashMap<u32, String>> {
+        if let Some(tags) = &self.model_tag_cache {
+            return tags.clone();
+        }
+        let mut counts: HashMap<u32, HashMap<String, usize>> = HashMap::new();
+        for name in self.rdb_block_names() {
+            let Some(data) = self.blocks_archive.record_by_name(&name) else { continue };
+            match read_model_tags(data) {
+                Ok(tags) => {
+                    for (model_id, tag) in tags {
+                        *counts.entry(model_id).or_default().entry(tag).or_default() += 1;
+                    }
+                }
+                Err(error) => log::warn!("could not read the model table of {name}: {error}"),
+            }
+        }
+        let tags: HashMap<u32, String> = counts
+            .into_iter()
+            .filter_map(|(model_id, tags)| {
+                let (tag, _) = tags
+                    .into_iter()
+                    .max_by(|first, second| first.1.cmp(&second.1).then_with(|| second.0.cmp(&first.0)))?;
+                Some((model_id, tag))
+            })
+            .collect();
+        let tags = Arc::new(tags);
+        self.model_tag_cache = Some(tags.clone());
+        tags
+    }
+
+    /// The id of every location and dungeon record in `MAPS.BSA` (empty without it).
+    pub fn location_ids(&self) -> HashSet<u16> {
+        self.maps_archive.as_ref().map(read_all_location_ids).unwrap_or_default()
+    }
+
+    /// The HMI song called `name` in `MIDI.BSA` (for example `DUNGEON5.HMI`),
+    /// read from the file each time (songs are only needed for previews).
+    pub fn midi_song(&self, name: &str) -> Arena2Result<Vec<u8>> {
+        let path = self
+            .files_by_name
+            .get(MIDI_FILE)
+            .ok_or_else(|| Arena2Error::not_found(format!("{MIDI_FILE} in the ARENA2 folder")))?;
+        let archive = BsaArchive::open(path)?;
+        archive
+            .record_by_name(name)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| Arena2Error::not_found(format!("{name} in {MIDI_FILE}")))
+    }
+
+    /// Whether `BLOCKS.BSA` has a block called `name`.
+    pub fn has_block(&self, name: &str) -> bool {
+        self.blocks_archive.record_by_name(name).is_some()
+    }
+
     /// Parses the RDB block called `name`.
     pub fn rdb_block(&self, name: &str) -> Arena2Result<RdbBlock> {
         let data = self
@@ -227,6 +310,29 @@ impl Arena2Library {
             .record_by_name(name)
             .ok_or_else(|| Arena2Error::not_found(format!("block '{name}' in {BLOCKS_FILE}")))?;
         parse_rdb_block(name, data)
+    }
+
+    /// Parses the RMB block called `name`.
+    ///
+    /// A few names that locations give do not exist; like Daggerfall Unity,
+    /// these fall back to a block with the same first four and last six
+    /// characters (for example `RUINAA12.RMB` for `RUINBA12.RMB`).
+    pub fn rmb_block(&self, name: &str) -> Arena2Result<RmbBlock> {
+        let found =
+            self.blocks_archive.record_by_name(name).map(|data| (name.to_string(), data)).or_else(|| {
+                let (prefix, suffix) = (name.get(..4)?, name.get(name.len().checked_sub(6)?..)?);
+                self.blocks_archive
+                    .entries()
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.name.starts_with(prefix) && entry.name.ends_with(suffix))
+                    .and_then(|entry| {
+                        Some((entry.name.clone(), self.blocks_archive.record_by_name(&entry.name)?))
+                    })
+            });
+        let (found_name, data) =
+            found.ok_or_else(|| Arena2Error::not_found(format!("block '{name}' in {BLOCKS_FILE}")))?;
+        parse_rmb_block(&found_name, data)
     }
 
     /// Loads (or fetches from cache) the texture archive with number `archive_index`.

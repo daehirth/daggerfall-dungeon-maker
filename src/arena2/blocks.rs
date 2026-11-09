@@ -146,6 +146,25 @@ pub fn parse_rdb_block(name: &str, data: &[u8]) -> Arena2Result<RdbBlock> {
     Ok(RdbBlock { name: name.to_string(), objects })
 }
 
+/// Reads the model reference table of an RDB block: each `ARCH3D.BSA` model
+/// id with the three letter tag the block gives it (for example `DOR` for an
+/// opening door). Daggerfall Unity decides some behaviour, such as which
+/// models are doors, by these tags.
+pub fn read_model_tags(data: &[u8]) -> Arena2Result<Vec<(u32, String)>> {
+    let mut reader = ByteReader::at(data, BLOCK_HEADER_SIZE);
+    let mut tags = Vec::new();
+    for _ in 0..MODEL_REFERENCE_COUNT {
+        let entry = reader.read_bytes(MODEL_REFERENCE_SIZE)?;
+        let id_text: String =
+            entry[..5].iter().take_while(|&&byte| byte != 0).map(|&byte| byte as char).collect();
+        if let Ok(model_id) = id_text.trim().parse::<u32>() {
+            let tag: String = entry[5..].iter().map(|&byte| byte as char).collect();
+            tags.push((model_id, tag));
+        }
+    }
+    Ok(tags)
+}
+
 /// Reads the table that maps a model index to an `ARCH3D.BSA` model id.
 fn read_model_reference_table(data: &[u8]) -> Arena2Result<Vec<Option<u32>>> {
     let mut reader = ByteReader::at(data, BLOCK_HEADER_SIZE);

@@ -5,6 +5,10 @@
 //! shows a ghost preview under the mouse, and a left click places a copy.
 //! Model tiles are captioned with the model's display name and can be
 //! renamed by right-clicking them.
+//!
+//! Any asset can be marked as a favourite with the star in its tile's corner
+//! (or its right-click menu); the **Favorites** tab lists them all, whatever
+//! their kind. Favourites are saved with the user's names (see [`CustomNames`]).
 
 use std::collections::HashMap;
 
@@ -14,7 +18,7 @@ use glam::Vec3;
 use crate::app::viewport_tools::EditorResources;
 use crate::arena2::{Arena2Library, TextureKey};
 use crate::catalog::{flat_description, AssetCatalog};
-use crate::custom_names::CustomNames;
+use crate::custom_names::{CustomNames, Favorite};
 use crate::render::ThumbnailStatus;
 use crate::scene::{
     default_model_object_name, FlatData, LightData, ModelData, SceneObject, SceneObjectKind,
@@ -27,6 +31,8 @@ const THUMBNAILS_PER_FRAME: usize = 4;
 const CAPTION_HEIGHT: f32 = 16.0;
 /// Gap between tiles, in points.
 const TILE_SPACING: f32 = 6.0;
+/// Colour of a favourite's star.
+const FAVORITE_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 200, 60);
 /// Radius given to newly placed lights, in world units (400 native units).
 const DEFAULT_LIGHT_RADIUS: f32 = 10.0;
 /// Height above the surface at which new lights are placed, in world units.
@@ -41,6 +47,24 @@ pub enum PlaceableAsset {
 }
 
 impl PlaceableAsset {
+    /// The favourite that marks this asset.
+    pub fn favorite(self) -> Favorite {
+        match self {
+            Self::Model { model_id } => Favorite::Model { model_id },
+            Self::Flat { texture } => Favorite::Flat { archive: texture.archive, record: texture.record },
+            Self::Light => Favorite::Light,
+        }
+    }
+
+    /// The asset a favourite marks.
+    pub fn of_favorite(favorite: Favorite) -> Self {
+        match favorite {
+            Favorite::Model { model_id } => Self::Model { model_id },
+            Favorite::Flat { archive, record } => Self::Flat { texture: TextureKey::new(archive, record) },
+            Favorite::Light => Self::Light,
+        }
+    }
+
     /// Name given to objects created from this asset.
     ///
     /// Models get their default object name so they are listed under the
@@ -119,6 +143,7 @@ pub struct ArmedAsset {
 /// The palette's tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaletteTab {
+    Favorites,
     RoomModels,
     AllModels,
     Flats,
@@ -127,10 +152,12 @@ enum PaletteTab {
 }
 
 impl PaletteTab {
-    const ALL: [Self; 5] = [Self::RoomModels, Self::AllModels, Self::Flats, Self::Markers, Self::Lights];
+    const ALL: [Self; 6] =
+        [Self::Favorites, Self::RoomModels, Self::AllModels, Self::Flats, Self::Markers, Self::Lights];
 
     fn label(self) -> &'static str {
         match self {
+            Self::Favorites => "★ Favorites",
             Self::RoomModels => "Cell models",
             Self::AllModels => "All models",
             Self::Flats => "Flats",
@@ -141,6 +168,7 @@ impl PaletteTab {
 
     fn tooltip(self) -> &'static str {
         match self {
+            Self::Favorites => "The assets you marked with the star in a tile's corner, of every kind",
             Self::RoomModels => "Models used in Daggerfall's dungeon cells, most common first",
             Self::AllModels => "Every model in ARCH3D.BSA",
             Self::Flats => "Billboard sprites used in dungeon cells: torches, furniture, people, treasure",
@@ -264,15 +292,29 @@ impl AssetPalette {
                                         &mut thumbnail_budget,
                                     );
                                     has_pending_thumbnails |= thumbnail == TileImage::Pending;
-                                    let response = self.draw_tile(ui, entry, thumbnail);
-                                    if response.clicked() {
+                                    let favorite = entry.asset.favorite();
+                                    let is_favorite = resources.custom_names.is_favorite(favorite);
+                                    let (response, star_clicked) =
+                                        self.draw_tile(ui, entry, thumbnail, is_favorite);
+                                    if star_clicked {
+                                        resources.custom_names.toggle_favorite(favorite);
+                                    } else if response.clicked() {
                                         self.toggle_armed(entry.asset);
                                     }
-                                    if let PlaceableAsset::Model { model_id } = entry.asset {
-                                        response.context_menu(|ui| {
+                                    response.context_menu(|ui| {
+                                        let text = match is_favorite {
+                                            true => "☆ Remove from favorites",
+                                            false => "★ Add to favorites",
+                                        };
+                                        if ui.button(text).clicked() {
+                                            resources.custom_names.toggle_favorite(favorite);
+                                            ui.close_menu();
+                                        }
+                                        if let PlaceableAsset::Model { model_id } = entry.asset {
+                                            ui.separator();
                                             show_model_name_menu(ui, model_id, resources.custom_names);
-                                        });
-                                    }
+                                        }
+                                    });
                                 }
                             });
                         }
@@ -311,7 +353,7 @@ impl AssetPalette {
                     ui.colored_label(hint_color, format!("Placing {asset_label} ({:.0}°)", armed.yaw_degrees));
                     ui.label(
                         egui::RichText::new(
-                            "Click in the cell to place · Shift+click to keep placing · R to rotate · Esc to cancel",
+                            "Click in the cell to place · Shift+click to keep placing · Q/E or R to turn · Alt: don't snap · Esc to cancel",
                         )
                         .weak(),
                     );
@@ -323,7 +365,7 @@ impl AssetPalette {
             None => {
                 ui.label(
                     egui::RichText::new(
-                        "Click an asset to start placing it in the cell · right-click a model to name it",
+                        "Click an asset to start placing it in the cell · ☆ in a tile's corner marks it as a favorite · right-click a model to name it",
                     )
                     .weak(),
                 );
@@ -342,8 +384,39 @@ impl AssetPalette {
                 || catalog.model_description(model_id).is_some_and(|description| description.matches(&search))
         };
         let entry = |asset, usage| PaletteEntry::new(asset, usage, custom_names, catalog);
+        let model_usage = |model_id: u32| match catalog.room_model(model_id) {
+            Some(model) => format!("Used in {} cells", model.room_count),
+            None => "Not used in any dungeon cell".to_string(),
+        };
 
         match self.tab {
+            PaletteTab::Favorites => custom_names
+                .favorites()
+                .iter()
+                .map(|&favorite| PlaceableAsset::of_favorite(favorite))
+                .filter_map(|asset| match asset {
+                    PlaceableAsset::Model { model_id } => {
+                        model_matches(model_id).then(|| entry(asset, model_usage(model_id)))
+                    }
+                    PlaceableAsset::Flat { texture } => {
+                        let flat =
+                            catalog.flats.iter().chain(&catalog.markers).find(|flat| flat.texture == texture);
+                        let description =
+                            flat.map_or_else(|| flat_description(texture), |flat| flat.description());
+                        let usage = match flat {
+                            Some(flat) => format!("{texture}\nUsed in {} cells", flat.room_count),
+                            None => texture.to_string(),
+                        };
+                        matches(&description).then(|| entry(asset, usage))
+                    }
+                    PlaceableAsset::Light => matches("light").then(|| {
+                        entry(
+                            asset,
+                            format!("Point light, radius {DEFAULT_LIGHT_RADIUS} m (editable after placing)"),
+                        )
+                    }),
+                })
+                .collect(),
             PaletteTab::RoomModels => catalog
                 .room_models
                 .iter()
@@ -360,13 +433,7 @@ impl AssetPalette {
                 .all_model_ids
                 .iter()
                 .filter(|&&model_id| model_matches(model_id))
-                .map(|&model_id| {
-                    let usage = match catalog.room_model(model_id) {
-                        Some(model) => format!("Used in {} cells", model.room_count),
-                        None => "Not used in any dungeon cell".to_string(),
-                    };
-                    entry(PlaceableAsset::Model { model_id }, usage)
-                })
+                .map(|&model_id| entry(PlaceableAsset::Model { model_id }, model_usage(model_id)))
                 .collect(),
             PaletteTab::Flats | PaletteTab::Markers => {
                 let flats = if self.tab == PaletteTab::Flats { &catalog.flats } else { &catalog.markers };
@@ -452,8 +519,16 @@ impl AssetPalette {
         }
     }
 
-    /// Draws one tile and returns its response.
-    fn draw_tile(&self, ui: &mut egui::Ui, entry: &PaletteEntry, image: TileImage) -> egui::Response {
+    /// Draws one tile, with the favourite star in its top-right corner (always
+    /// shown for a favourite, otherwise while the pointer is over the tile).
+    /// Returns its response and whether the star was clicked.
+    fn draw_tile(
+        &self,
+        ui: &mut egui::Ui,
+        entry: &PaletteEntry,
+        image: TileImage,
+        is_favorite: bool,
+    ) -> (egui::Response, bool) {
         let tile_size = self.tile_size;
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(tile_size, tile_size + CAPTION_HEIGHT), egui::Sense::click());
@@ -515,6 +590,28 @@ impl AssetPalette {
             );
         }
 
+        let star_rect = egui::Rect::from_min_size(
+            egui::pos2(image_rect.right() - 20.0, image_rect.top() + 2.0),
+            egui::vec2(18.0, 18.0),
+        );
+        let pointer = ui.ctx().pointer_interact_pos();
+        let over_star = response.hovered() && pointer.is_some_and(|pointer| star_rect.contains(pointer));
+        let star_clicked = response.clicked() && pointer.is_some_and(|pointer| star_rect.contains(pointer));
+        if is_favorite || response.hovered() {
+            let (star, color) = match (is_favorite, over_star) {
+                (true, _) => ("★", FAVORITE_COLOR),
+                (false, true) => ("★", egui::Color32::from_gray(200)),
+                (false, false) => ("☆", egui::Color32::from_gray(150)),
+            };
+            painter.text(
+                star_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                star,
+                egui::FontId::proportional(15.0),
+                color,
+            );
+        }
+
         painter.text(
             egui::pos2(rect.center().x, image_rect.bottom() + 2.0),
             egui::Align2::CENTER_TOP,
@@ -527,7 +624,18 @@ impl AssetPalette {
             PlaceableAsset::Model { .. } => " · right-click to name it",
             _ => "",
         };
-        response.on_hover_text(format!("{}\n{}\nClick to place{rename_hint}", entry.caption, entry.details))
+        let favorite_hint = match is_favorite {
+            true => "★ to remove from favorites",
+            false => "☆ to add to favorites",
+        };
+        let response = match over_star {
+            true => response.on_hover_text(favorite_hint),
+            false => response.on_hover_text(format!(
+                "{}\n{}\nClick to place · {favorite_hint}{rename_hint}",
+                entry.caption, entry.details
+            )),
+        };
+        (response, star_clicked)
     }
 }
 

@@ -103,6 +103,12 @@ pub struct RoomEditor {
     open_request: Option<OpenedItem>,
     /// An action being played back in the viewport, if any.
     preview: Option<ActionPreview>,
+    /// Open faces of the models placed or being placed, for snapping, by model id.
+    open_faces: std::collections::HashMap<u32, std::sync::Arc<[crate::connectors::OpenFace]>>,
+    /// Openings of the cell's models that lead to empty space, shown as yellow panes.
+    unclosed: Vec<crate::connectors::UnclosedFace>,
+    /// What the openings were last checked for (a hash of the objects), and when.
+    unclosed_checked: Option<(u64, f64)>,
     /// The dungeon selected under "Used in", whose other cells are shown faded around this one.
     selected_dungeon: Option<OpenedItem>,
     /// The dungeon and layout place this cell was opened at, so the cells around
@@ -227,6 +233,9 @@ impl RoomEditor {
             used_in: Vec::new(),
             open_request: None,
             preview: None,
+            open_faces: std::collections::HashMap::new(),
+            unclosed: Vec::new(),
+            unclosed_checked: None,
             selected_dungeon: None,
             scroll_to_selected_dungeon: false,
             home_placement: None,
@@ -293,37 +302,41 @@ impl RoomEditor {
         start: usize,
         library: &mut Arena2Library,
     ) -> Vec<(usize, ActionMotion)> {
-        let mut motions = Vec::new();
-        for index in self.scene.action_chain(start) {
-            match self.scene.objects[index].kind {
-                SceneObjectKind::Model { model_id, data } => {
-                    let Some(action) = data.action else { continue };
-                    if let Some(motion) = action.motion() {
-                        motions.push((index, motion));
-                    } else if action.action_type == OPEN_DOOR_ACTION
-                        && library.model(model_id).and_then(|mesh| mesh.door_kind())
-                            == Some(DoorKind::Building)
-                    {
-                        motions.push((index, ActionMotion::door_swing()));
-                    }
+        self.scene
+            .action_chain(start)
+            .into_iter()
+            .filter_map(|index| Some((index, self.object_motion(index, library)?)))
+            .collect()
+    }
+
+    /// How object `index` moves when its action plays, if it moves.
+    pub(super) fn object_motion(&self, index: usize, library: &mut Arena2Library) -> Option<ActionMotion> {
+        match self.scene.objects.get(index)?.kind {
+            SceneObjectKind::Model { model_id, data } => {
+                let action = data.action?;
+                if let Some(motion) = action.motion() {
+                    Some(motion)
+                } else if action.action_type == OPEN_DOOR_ACTION
+                    && library.model(model_id).and_then(|mesh| mesh.door_kind()) == Some(DoorKind::Building)
+                {
+                    Some(ActionMotion::door_swing())
+                } else {
+                    None
                 }
-                SceneObjectKind::Flat { data, .. } if data.action != 0 => {
-                    // Flats' actions use their magnitude byte as both axis and magnitude, with no duration.
-                    let [magnitude, _] = data.faction_or_mobile_id.to_le_bytes();
-                    let action = ObjectAction {
-                        action_type: data.action,
-                        axis: magnitude,
-                        duration: 0,
-                        magnitude: u16::from(magnitude),
-                    };
-                    if let Some(motion) = action.motion() {
-                        motions.push((index, motion));
-                    }
-                }
-                _ => {}
             }
+            SceneObjectKind::Flat { data, .. } if data.action != 0 => {
+                // Flats' actions use their magnitude byte as both axis and magnitude, with no duration.
+                let [magnitude, _] = data.faction_or_mobile_id.to_le_bytes();
+                let action = ObjectAction {
+                    action_type: data.action,
+                    axis: magnitude,
+                    duration: 0,
+                    magnitude: u16::from(magnitude),
+                };
+                action.motion()
+            }
+            _ => None,
         }
-        motions
     }
 
     /// Starts playing object `index`'s action chain in the viewport.
@@ -609,8 +622,16 @@ impl RoomEditor {
                 self.selected_object = None;
             }
         }
-        for (modifiers, degrees) in [(Modifiers::SHIFT, -90.0), (Modifiers::NONE, 90.0)] {
-            if shortcut(modifiers, Key::R) {
+        // R (Shift+R the other way), and Q and E, turn the object being placed or
+        // the one selected object by a quarter turn. Q and E are left to the
+        // camera while the right mouse button is held (flying).
+        let flying = context.input(|input| input.pointer.secondary_down());
+        let mut turns = vec![(Modifiers::SHIFT, Key::R, -90.0), (Modifiers::NONE, Key::R, 90.0)];
+        if !flying {
+            turns.extend([(Modifiers::NONE, Key::Q, -90.0), (Modifiers::NONE, Key::E, 90.0)]);
+        }
+        for (modifiers, key, degrees) in turns {
+            if shortcut(modifiers, key) {
                 if is_placing {
                     self.palette.rotate_armed(degrees);
                 } else {

@@ -11,6 +11,8 @@
 //! doors that swing), how big it is, and the names stored in the headers of
 //! the texture archives it is drawn with ("Door Set", "Torture stuff", ...).
 
+use crate::connectors::{DoorSlots, OpeningsLeftOpen};
+use crate::scene::Scene;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
@@ -209,6 +211,11 @@ pub struct AssetCatalog {
     room_model_positions: HashMap<u32, usize>,
     /// Description of every model that could be decoded, by model id.
     model_descriptions: HashMap<u32, ModelDescription>,
+    /// Where doors stand in each piece, learned from every room.
+    pub door_slots: DoorSlots,
+    /// Openings of pieces that Daggerfall's own dungeons leave open. Learned
+    /// in the background after the game data loads, so `None` until then.
+    pub openings_left_open: Option<std::sync::Arc<OpeningsLeftOpen>>,
 }
 
 /// How often one model is used across all rooms, while the catalog is being built.
@@ -227,6 +234,7 @@ impl AssetCatalog {
     pub fn build(library: &mut Arena2Library) -> Self {
         let mut model_usage: BTreeMap<u32, ModelUsageCounter> = BTreeMap::new();
         let mut flat_usage: BTreeMap<TextureKey, BTreeSet<usize>> = BTreeMap::new();
+        let mut door_slots = DoorSlots::default();
 
         for (room_index, room_name) in library.rdb_block_names().iter().enumerate() {
             let block = match library.rdb_block(room_name) {
@@ -252,6 +260,7 @@ impl AssetCatalog {
                     RdbObjectKind::Light(_) => {}
                 }
             }
+            door_slots.learn(&Scene::from_rdb_block(&block), library);
         }
 
         let mut room_models: Vec<ModelAsset> = model_usage
@@ -294,6 +303,8 @@ impl AssetCatalog {
             markers,
             room_model_positions,
             model_descriptions: HashMap::new(),
+            door_slots,
+            openings_left_open: None,
         };
         catalog.model_descriptions = catalog
             .all_model_ids

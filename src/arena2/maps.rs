@@ -6,13 +6,15 @@
 //! The dungeon's type (crypt, orc stronghold, …), which decides the enemies at
 //! its random enemy markers, is stored separately in the region's `MAPTABLE`
 //! record, one entry per location. Locations are matched up through the
-//! location ids in `MAPPITEM`, as Daggerfall Unity does.
+//! location ids in `MAPPITEM`, as Daggerfall Unity does. `MAPTABLE` also
+//! gives the location's position on the world map and its location type.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::bsa::BsaArchive;
 use super::error::{Arena2Error, Arena2Result};
 use super::reader::ByteReader;
+use super::world::{LocationType, MapPixel, MapTableEntry};
 use crate::encounters::DungeonType;
 
 /// Region names in the order used by the `###` suffix of `MAPS.BSA` records.
@@ -87,6 +89,11 @@ const RDB_BLOCK_LETTERS: [char; 6] = ['N', 'W', 'L', 'S', 'B', 'M'];
 const LOCATION_DOOR_SIZE: usize = 6;
 /// Offset of the location id inside the location record header.
 const LOCATION_ID_OFFSET: usize = 33;
+/// Offsets of the world position inside the location record header.
+const LOCATION_X_OFFSET: usize = 7;
+const LOCATION_Y_OFFSET: usize = 15;
+/// Offset, inside a location record header, of the value that decides a dungeon's music.
+const LOCATION_MUSIC_SEED_OFFSET: usize = 27;
 /// Offset of the location name inside the location record header.
 const LOCATION_NAME_OFFSET: usize = 71;
 /// Length of the location name field.
@@ -97,10 +104,25 @@ const LOCATION_HEADER_SIZE: usize = 112;
 const DUNGEON_HEADER_SIZE: usize = 17;
 /// Offset of the block count within the dungeon header.
 const DUNGEON_BLOCK_COUNT_OFFSET: usize = 10;
-/// Size of one location's entry in a `MAPTABLE` record.
-const MAP_TABLE_ENTRY_SIZE: usize = 17;
-/// Offset of the dungeon type within a `MAPTABLE` entry.
-const MAP_TABLE_DUNGEON_TYPE_OFFSET: usize = 12;
+/// Size of the building list header that follows a location record header.
+const BUILDING_LIST_HEADER_SIZE: usize = 7;
+/// Size of one building entry in a location's building list.
+const LOCATION_BUILDING_SIZE: usize = 26;
+/// Offsets within a location's exterior data.
+const EXTERIOR_WIDTH_OFFSET: usize = 40;
+const EXTERIOR_LETTER_OFFSET: usize = 46;
+const EXTERIOR_BLOCK_INDEX_OFFSET: usize = 49;
+/// Length of each of the exterior's block index, number and character tables.
+const EXTERIOR_BLOCK_TABLE_LENGTH: usize = 64;
+/// First part of an RMB block name, chosen by the block index.
+const RMB_BLOCK_PREFIXES: [&str; 45] = [
+    "TVRN", "GENR", "RESI", "WEAP", "ARMR", "ALCH", "BANK", "BOOK", "CLOT", "FURN", "GEMS", "LIBR", "PAWN",
+    "TEMP", "TEMP", "PALA", "FARM", "DUNG", "CAST", "MANR", "SHRI", "RUIN", "SHCK", "GRVE", "FILL", "KRAV",
+    "KDRA", "KOWL", "KMOO", "KCAN", "KFLA", "KHOR", "KROS", "KWHE", "KSCA", "KHAW", "MAGE", "THIE", "DARK",
+    "FIGH", "CUST", "WALL", "MARK", "SHIP", "WITC",
+];
+/// Second letter of an RMB block name, chosen by two bits of the block character.
+const RMB_SECOND_LETTERS: [char; 4] = ['A', 'L', 'M', 'S'];
 /// Location id of Orsinium, which needs a manual fix for an overlapping block.
 const ORSINIUM_LOCATION_ID: u16 = 50015;
 /// Index of the Orsinium block that the game moves, and the row it moves it to.
@@ -118,8 +140,67 @@ pub struct DungeonDefinition {
     pub name: String,
     /// The kind of dungeon, which decides the enemies at random enemy markers; `None` if unknown.
     pub dungeon_type: Option<DungeonType>,
+    /// Where the dungeon is on the world map; `None` if unknown.
+    pub map_pixel: Option<MapPixel>,
+    /// The kind of location (large dungeon, graveyard, …); `None` if unknown.
+    pub location_type: Option<LocationType>,
+    /// What stands above ground; `None` if unknown.
+    pub exterior: Option<LocationExterior>,
+    /// The game's own record of the location, needed to replace it; `None` if unknown.
+    pub classic: Option<ClassicLocation>,
     /// Blocks making up the dungeon.
     pub blocks: Vec<DungeonBlockPlacement>,
+}
+
+/// What identifies a location in the game data, which a replacement of it
+/// must keep so the game (and its quests and saved games) still find it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassicLocation {
+    /// Index of the location in its region.
+    pub location_index: usize,
+    /// Map id as the game stores it.
+    pub map_id: i32,
+    pub longitude: i32,
+    pub latitude: i32,
+    pub discovered: bool,
+    pub key: u32,
+    /// Id of the location's own record.
+    pub location_id: u16,
+    /// Id of its dungeon's record.
+    pub dungeon_location_id: u16,
+    /// World position, in native units, from the location's record.
+    pub world_x: i32,
+    pub world_y: i32,
+    /// The value in the dungeon's record that, with the region, decides the
+    /// music played inside (Daggerfall Unity reads it as `Unknown2`).
+    pub dungeon_music_seed: u32,
+}
+
+/// The above-ground part of a location: a grid of RMB blocks.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LocationExterior {
+    /// Blocks from west to east.
+    pub width: usize,
+    /// Blocks from south to north.
+    pub height: usize,
+    /// RMB block names, row by row, as the location names them. A few names
+    /// do not exist in `BLOCKS.BSA` and must be resolved as Daggerfall Unity
+    /// does (see `Arena2Library::rmb_block`).
+    pub block_names: Vec<String>,
+    /// The location's buildings (most dungeon entrances have none).
+    pub buildings: Vec<LocationBuilding>,
+}
+
+/// One building of a location, as its `MAPPITEM` record lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LocationBuilding {
+    /// Seed for the building's name.
+    pub name_seed: u16,
+    pub faction_id: u16,
+    pub sector: i16,
+    /// Building type number (Daggerfall Unity's `BuildingTypes`).
+    pub building_type: u8,
+    pub quality: u8,
 }
 
 /// One RDB block placed on the dungeon grid.
@@ -146,12 +227,11 @@ pub fn read_all_dungeons(maps_archive: &BsaArchive) -> Vec<DungeonDefinition> {
         let Some(record) = maps_archive.record_by_name(&record_name) else {
             continue;
         };
-        let dungeon_types = read_dungeon_types(maps_archive, region_index).unwrap_or_else(|error| {
-            log::warn!("could not read dungeon types of region {region_index}: {error}");
+        let map_table = read_map_table(maps_archive, region_index).unwrap_or_else(|error| {
+            log::warn!("could not read the map table of region {region_index}: {error}");
             HashMap::new()
         });
-        if let Err(error) =
-            read_region_dungeons(region_index, region_name, record, &dungeon_types, &mut dungeons)
+        if let Err(error) = read_region_dungeons(region_index, region_name, record, &map_table, &mut dungeons)
         {
             log::warn!("could not read dungeons in {record_name}: {error}");
         }
@@ -167,7 +247,7 @@ fn read_region_dungeons(
     region_index: usize,
     region_name: &'static str,
     record: &[u8],
-    dungeon_types: &HashMap<u16, DungeonType>,
+    map_table: &HashMap<u16, LocationInfo>,
     dungeons: &mut Vec<DungeonDefinition>,
 ) -> Arena2Result<()> {
     if record.is_empty() {
@@ -182,8 +262,27 @@ fn read_region_dungeons(
         let record_offset = offset_table.read_u32()? as usize;
         let _is_dungeon = offset_table.read_u16()?;
         let exterior_location_id = offset_table.read_u16()?;
-        let mut dungeon = read_dungeon(region_index, region_name, record, records_start + record_offset)?;
-        dungeon.dungeon_type = dungeon_types.get(&exterior_location_id).copied();
+        let dungeon_position = records_start + record_offset;
+        let mut dungeon = read_dungeon(region_index, region_name, record, dungeon_position)?;
+        if let Some(info) = map_table.get(&exterior_location_id) {
+            dungeon.dungeon_type = DungeonType::from_raw(info.entry.dungeon_type);
+            dungeon.map_pixel = Some(info.entry.pixel);
+            dungeon.location_type = info.entry.location_type;
+            dungeon.exterior = info.exterior.clone();
+            dungeon.classic = Some(ClassicLocation {
+                location_index: info.location_index,
+                map_id: info.entry.map_id,
+                longitude: info.entry.longitude,
+                latitude: info.entry.latitude,
+                discovered: info.entry.discovered,
+                key: info.entry.key,
+                location_id: exterior_location_id,
+                dungeon_location_id: read_location_id(record, dungeon_position)?,
+                dungeon_music_seed: read_record_value(record, dungeon_position, LOCATION_MUSIC_SEED_OFFSET)?,
+                world_x: info.world_x,
+                world_y: info.world_y,
+            });
+        }
         dungeons.push(dungeon);
     }
     Ok(())
@@ -240,17 +339,38 @@ fn read_dungeon(
         }
     }
 
-    Ok(DungeonDefinition { region_index, region_name, name, dungeon_type: None, blocks })
+    Ok(DungeonDefinition {
+        region_index,
+        region_name,
+        name,
+        dungeon_type: None,
+        map_pixel: None,
+        location_type: None,
+        exterior: None,
+        classic: None,
+        blocks,
+    })
 }
 
-/// Reads the dungeon type of every location in a region, keyed by location id.
+/// What is known of a location besides its dungeon.
+struct LocationInfo {
+    entry: MapTableEntry,
+    exterior: Option<LocationExterior>,
+    /// Index of the location in its region.
+    location_index: usize,
+    /// World position from the location's record.
+    world_x: i32,
+    world_y: i32,
+}
+
+/// Reads the `MAPTABLE` entry and exterior of every location in a region, keyed by location id.
 ///
 /// `MAPNAMES` gives the number of locations, `MAPPITEM` each location's id and
-/// `MAPTABLE` each location's dungeon type, all in the same location order.
-fn read_dungeon_types(
+/// exterior and `MAPTABLE` each location's entry, all in the same location order.
+fn read_map_table(
     maps_archive: &BsaArchive,
     region_index: usize,
-) -> Arena2Result<HashMap<u16, DungeonType>> {
+) -> Arena2Result<HashMap<u16, LocationInfo>> {
     let record = |kind: &str| {
         let name = format!("{kind}.{region_index:03}");
         maps_archive
@@ -261,22 +381,146 @@ fn read_dungeon_types(
     let locations = record("MAPPITEM")?;
     let map_table = record("MAPTABLE")?;
 
-    let mut dungeon_types = HashMap::new();
+    let mut entries = HashMap::new();
     let mut offset_table = ByteReader::new(locations);
     for location_index in 0..location_count {
         let location_start = location_count * 4 + offset_table.read_u32()? as usize;
         let location_id = read_location_id(locations, location_start)?;
-        let type_position = location_index * MAP_TABLE_ENTRY_SIZE + MAP_TABLE_DUNGEON_TYPE_OFFSET;
-        let raw_type = ByteReader::at(map_table, type_position).read_u8()?;
-        if let Some(dungeon_type) = DungeonType::from_raw(raw_type) {
-            dungeon_types.insert(location_id, dungeon_type);
+        let exterior = read_exterior(locations, location_start)
+            .map_err(|error| log::warn!("could not read the exterior of location {location_id}: {error}"))
+            .ok();
+        let door_count = ByteReader::at(locations, location_start).read_u32()? as usize;
+        let header = location_start + 4 + door_count * LOCATION_DOOR_SIZE;
+        entries.insert(
+            location_id,
+            LocationInfo {
+                entry: MapTableEntry::read(map_table, location_index)?,
+                exterior,
+                location_index,
+                world_x: ByteReader::at(locations, header + LOCATION_X_OFFSET).read_i32()?,
+                world_y: ByteReader::at(locations, header + LOCATION_Y_OFFSET).read_i32()?,
+            },
+        );
+    }
+    Ok(entries)
+}
+
+/// Reads the exterior of the `MAPPITEM` location record starting at `position`.
+fn read_exterior(record: &[u8], position: usize) -> Arena2Result<LocationExterior> {
+    let door_count = ByteReader::at(record, position).read_u32()? as usize;
+    let building_list = position + 4 + door_count * LOCATION_DOOR_SIZE + LOCATION_HEADER_SIZE;
+    let building_count = usize::from(ByteReader::at(record, building_list).read_u16()?);
+    let buildings_start = building_list + BUILDING_LIST_HEADER_SIZE;
+    let exterior = buildings_start + building_count * LOCATION_BUILDING_SIZE;
+    let buildings = (0..building_count)
+        .map(|building| read_building(record, buildings_start + building * LOCATION_BUILDING_SIZE))
+        .collect::<Arena2Result<_>>()?;
+
+    let mut reader = ByteReader::at(record, exterior + EXTERIOR_WIDTH_OFFSET);
+    let width = usize::from(reader.read_u8()?);
+    let height = usize::from(reader.read_u8()?);
+    let first_letter = char::from(ByteReader::at(record, exterior + EXTERIOR_LETTER_OFFSET).read_u8()?);
+    let mut tables = ByteReader::at(record, exterior + EXTERIOR_BLOCK_INDEX_OFFSET);
+    let indices = tables.read_bytes(EXTERIOR_BLOCK_TABLE_LENGTH)?;
+    let numbers = tables.read_bytes(EXTERIOR_BLOCK_TABLE_LENGTH)?;
+    let characters = tables.read_bytes(EXTERIOR_BLOCK_TABLE_LENGTH)?;
+    if width * height > EXTERIOR_BLOCK_TABLE_LENGTH {
+        return Err(Arena2Error::format(format!("exterior of {width} × {height} blocks")));
+    }
+    let block_names = (0..width * height)
+        .map(|block| rmb_block_name(indices[block], numbers[block], characters[block], first_letter))
+        .collect::<Arena2Result<_>>()?;
+    Ok(LocationExterior { width, height, block_names, buildings })
+}
+
+/// Reads one building entry of a location's building list.
+fn read_building(record: &[u8], position: usize) -> Arena2Result<LocationBuilding> {
+    let mut reader = ByteReader::at(record, position);
+    let name_seed = reader.read_u16()?;
+    // Service time limit (4 bytes), then four values of unknown meaning (12 bytes).
+    reader.read_bytes(16)?;
+    let faction_id = reader.read_u16()?;
+    let sector = reader.read_u16()? as i16;
+    let _location_id = reader.read_u16()?;
+    let building_type = reader.read_u8()?;
+    let quality = reader.read_u8()?;
+    Ok(LocationBuilding { name_seed, faction_id, sector, building_type, quality })
+}
+
+/// The id of every location record in `MAPS.BSA`: each location's own and
+/// each dungeon's. A new location must use ids none of these use.
+pub fn read_all_location_ids(maps_archive: &BsaArchive) -> HashSet<u16> {
+    let mut ids = HashSet::new();
+    for region_index in 0..REGION_NAMES.len() {
+        let record = |kind: &str| maps_archive.record_by_name(&format!("{kind}.{region_index:03}"));
+        let result = (|| -> Arena2Result<()> {
+            if let (Some(names), Some(locations)) = (record("MAPNAMES"), record("MAPPITEM")) {
+                if !names.is_empty() {
+                    let location_count = ByteReader::new(names).read_u32()? as usize;
+                    let mut offsets = ByteReader::new(locations);
+                    for _ in 0..location_count {
+                        let start = location_count * 4 + offsets.read_u32()? as usize;
+                        ids.insert(read_location_id(locations, start)?);
+                    }
+                }
+            }
+            if let Some(dungeons) = record("MAPDITEM").filter(|record| !record.is_empty()) {
+                let mut offsets = ByteReader::new(dungeons);
+                let dungeon_count = offsets.read_u32()? as usize;
+                let records_start = 4 + dungeon_count * 8;
+                for _ in 0..dungeon_count {
+                    let record_offset = offsets.read_u32()? as usize;
+                    let _is_dungeon = offsets.read_u16()?;
+                    ids.insert(offsets.read_u16()?);
+                    ids.insert(read_location_id(dungeons, records_start + record_offset)?);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            log::warn!("could not read the location ids of region {region_index}: {error}");
         }
     }
-    Ok(dungeon_types)
+    ids
+}
+
+/// Builds an RMB block name from a location's block tables, as Daggerfall Unity does.
+fn rmb_block_name(index: u8, number: u8, character: u8, first_letter: char) -> Arena2Result<String> {
+    let prefix = RMB_BLOCK_PREFIXES
+        .get(usize::from(index))
+        .ok_or_else(|| Arena2Error::format(format!("unknown RMB block index {index}")))?;
+    let letter1 = if character & 0x10 != 0 { first_letter } else { 'A' };
+    let letter2 = RMB_SECOND_LETTERS[usize::from(character.wrapping_mul(2) >> 6)];
+    let numbers = match index {
+        // Temples.
+        13 | 14 => format!("{}{number}", char::from(b'A' + (character & 0xf))),
+        _ => format!("{number:02}"),
+    };
+    Ok(format!("{prefix}{letter1}{letter2}{numbers}.RMB"))
+}
+
+/// Reads the `u32` at `offset` in the header of the location record starting at `position`.
+fn read_record_value(record: &[u8], position: usize, offset: usize) -> Arena2Result<u32> {
+    let door_count = ByteReader::at(record, position).read_u32()? as usize;
+    ByteReader::at(record, position + 4 + door_count * LOCATION_DOOR_SIZE + offset).read_u32()
 }
 
 /// Reads the id of the location record starting at `position`: past its door list, in its header.
 fn read_location_id(record: &[u8], position: usize) -> Arena2Result<u16> {
     let door_count = ByteReader::at(record, position).read_u32()? as usize;
     ByteReader::at(record, position + 4 + door_count * LOCATION_DOOR_SIZE + LOCATION_ID_OFFSET).read_u16()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_rmb_block_names() {
+        assert_eq!(rmb_block_name(17, 3, 0, 'B').unwrap(), "DUNGAA03.RMB");
+        // Bit 0x10 takes the location's own first letter; bits 5 and 6 the second letter.
+        assert_eq!(rmb_block_name(21, 12, 0x10 | 0x40, 'B').unwrap(), "RUINBM12.RMB");
+        assert_eq!(rmb_block_name(13, 2, 0x03, 'A').unwrap(), "TEMPAAD2.RMB");
+        assert!(rmb_block_name(200, 0, 0, 'A').is_err());
+    }
 }

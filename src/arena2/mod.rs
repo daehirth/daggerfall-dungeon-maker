@@ -13,18 +13,27 @@
 mod blocks;
 mod bsa;
 mod error;
+mod hmi;
 mod library;
 mod maps;
 mod mesh;
 mod reader;
+mod rmb;
 mod texture;
+mod world;
 
 pub use blocks::{RdbAction, RdbBlock, RdbObject, RdbObjectKind};
 pub use error::{Arena2Error, Arena2Result};
+pub use hmi::{parse_hmi, MidiEvent, MidiSong};
 pub use library::Arena2Library;
-pub use maps::{DungeonBlockPlacement, DungeonDefinition};
-pub use mesh::{DoorKind, ModelMesh};
+pub use maps::{
+    ClassicLocation, DungeonBlockPlacement, DungeonDefinition, LocationBuilding, LocationExterior,
+    REGION_NAMES,
+};
+pub use mesh::{DoorKind, MeshVertex, ModelMesh, SubMesh};
+pub use rmb::{RmbBlock, RmbFlat, RmbModel, RMB_BLOCK_SIDE};
 pub use texture::RgbaImage;
+pub use world::{region_name, LocationType, MapPixel, WorldLocation, WorldMap, MAP_HEIGHT, MAP_WIDTH};
 
 use glam::{IVec3, Vec3};
 

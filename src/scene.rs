@@ -505,6 +505,21 @@ impl SceneObject {
         Quat::from_euler(EulerRot::ZXY, radians.z, radians.x, radians.y)
     }
 
+    /// Sets the rotation from `rotation`, rounding away floating point noise.
+    pub fn set_rotation(&mut self, rotation: Quat) {
+        let (z, x, y) = rotation.to_euler(EulerRot::ZXY);
+        let round = |radians: f32| {
+            let degrees = (radians.to_degrees() * 100.0).round() / 100.0;
+            // Avoid showing "-0".
+            if degrees == 0.0 {
+                0.0
+            } else {
+                degrees
+            }
+        };
+        self.rotation_degrees = Vec3::new(round(x), round(y), round(z));
+    }
+
     /// Local-to-world transform of the object.
     pub fn model_matrix(&self) -> Mat4 {
         Mat4::from_rotation_translation(self.rotation(), self.position)

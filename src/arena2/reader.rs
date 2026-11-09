@@ -24,6 +24,11 @@ impl<'data> ByteReader<'data> {
         Self { data, position }
     }
 
+    /// The cursor's absolute byte offset.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
     /// Moves the cursor to an absolute byte offset.
     pub fn seek(&mut self, position: usize) {
         self.position = position;

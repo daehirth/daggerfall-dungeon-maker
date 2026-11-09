@@ -13,10 +13,13 @@
 mod arena2_prompt;
 mod dungeon_browser;
 mod dungeon_view;
+mod entrance_picker;
+mod export_window;
 mod project_panel;
 mod room_browser;
 mod room_editor;
 mod viewport_tools;
+mod world_map;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,17 +27,20 @@ use std::path::{Path, PathBuf};
 use eframe::{egui, egui_wgpu};
 use glam::Vec3;
 
-use crate::arena2::{Arena2Library, RDB_BLOCK_SIDE};
+use crate::arena2::{Arena2Library, DungeonDefinition, RDB_BLOCK_SIDE};
 use crate::catalog::AssetCatalog;
+use crate::connectors::OpeningsLeftOpen;
 use crate::custom_names::CustomNames;
 use crate::project::{
-    ItemId, Project, ProjectDungeon, ProjectDungeonRoom, ProjectEntry, ProjectRoom, PROJECT_FILE_EXTENSION,
+    DungeonLocation, ItemId, Project, ProjectDungeon, ProjectDungeonRoom, ProjectEntry, ProjectRoom,
+    PROJECT_FILE_EXTENSION,
 };
 use crate::render::{RoomOutline, SceneRenderer};
 use crate::scene::Scene;
 use arena2_prompt::Arena2Prompt;
 use dungeon_browser::DungeonBrowser;
-use dungeon_view::{DungeonDetails, DungeonPropertiesAction, DungeonView};
+use dungeon_view::{DungeonDetails, DungeonPropertiesAction, DungeonView, LocationWindowsRequest};
+use export_window::{ExportRequest, ExportWindow};
 use project_panel::{OpenedItem, PanelAction, ProjectPanel};
 use room_browser::RoomBrowser;
 use room_editor::{ContextCell, DungeonContext, RoomEditor, UsedInEntry};
@@ -44,6 +50,12 @@ use viewport_tools::EditorResources;
 const ARENA2_FOLDER_STORAGE_KEY: &str = "arena2_folder";
 /// Storage key under which the user's room and model names are saved.
 const CUSTOM_NAMES_STORAGE_KEY: &str = "custom_names";
+/// Storage key of the openings Daggerfall's dungeons leave open, learned from the game data.
+const OPENINGS_STORAGE_KEY: &str = "openings_left_open";
+/// Storage key of the export window's settings (folders, Unity editor, platforms).
+const EXPORT_SETTINGS_STORAGE_KEY: &str = "export_settings";
+/// Storage key of what the project panel shows.
+const PANEL_VIEW_STORAGE_KEY: &str = "project_panel_view";
 /// Storage key under which the last project file is remembered, to reopen it on the next run.
 const PROJECT_FILE_STORAGE_KEY: &str = "project_file";
 /// How long the pointer must rest on something before its explanation appears.
@@ -125,6 +137,15 @@ enum DiscardingAction {
     Exit,
 }
 
+/// The openings Daggerfall's dungeons leave open, as saved with the settings,
+/// with the game data they were learned from.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredOpenings {
+    folder: String,
+    version: u32,
+    openings: OpeningsLeftOpen,
+}
+
 /// The dungeon maker application.
 pub struct DungeonMakerApp {
     /// Loaded game data; `None` until the user has chosen an ARENA2 folder.
@@ -155,6 +176,11 @@ pub struct DungeonMakerApp {
     room_browser: RoomBrowser,
     dungeon_browser: DungeonBrowser,
     project_panel: ProjectPanel,
+    export_window: ExportWindow,
+    /// The learned openings, as saved with the settings.
+    stored_openings: Option<StoredOpenings>,
+    /// Learning the openings in the background: the folder and where the result arrives.
+    openings_job: Option<(PathBuf, std::sync::mpsc::Receiver<OpeningsLeftOpen>)>,
     copy_prompt: Option<CopyPrompt>,
     /// Room or dungeon the user asked to delete, waiting for confirmation.
     delete_prompt: Option<ItemId>,
@@ -194,6 +220,21 @@ impl DungeonMakerApp {
             .and_then(|storage| eframe::get_value(storage, CUSTOM_NAMES_STORAGE_KEY))
             .unwrap_or_default();
 
+        let mut project_panel = ProjectPanel::default();
+        if let Some(view) =
+            creation_context.storage.and_then(|storage| eframe::get_value(storage, PANEL_VIEW_STORAGE_KEY))
+        {
+            project_panel.view = view;
+        }
+
+        let mut export_window = ExportWindow::default();
+        if let Some(settings) = creation_context
+            .storage
+            .and_then(|storage| eframe::get_value(storage, EXPORT_SETTINGS_STORAGE_KEY))
+        {
+            export_window.settings = settings;
+        }
+
         let project = Project::default();
         let saved_project_text = project.to_file_text();
         let mut app = Self {
@@ -213,7 +254,12 @@ impl DungeonMakerApp {
             arena2_prompt: Arena2Prompt::new(true, saved_folder.as_deref()),
             room_browser: RoomBrowser::default(),
             dungeon_browser: DungeonBrowser::default(),
-            project_panel: ProjectPanel::default(),
+            project_panel,
+            export_window,
+            stored_openings: creation_context
+                .storage
+                .and_then(|storage| eframe::get_value(storage, OPENINGS_STORAGE_KEY)),
+            openings_job: None,
             copy_prompt: None,
             delete_prompt: None,
             unsaved_changes_prompt: None,
@@ -264,6 +310,7 @@ impl DungeonMakerApp {
                 }
                 self.project_panel.set_daggerfall_contents(room_names, dungeons);
                 self.catalog = AssetCatalog::build(&mut library);
+                self.start_learning_openings(&library);
                 self.status_message = format!("Loaded game data from {}", folder.display());
                 self.library = Some(library);
                 // Cached GPU resources belong to the old data, so start afresh.
@@ -275,6 +322,51 @@ impl DungeonMakerApp {
                 self.arena2_prompt.is_open = false;
             }
             Err(error) => self.arena2_prompt.open(Some(error.to_string())),
+        }
+    }
+
+    /// Gives the catalog the openings Daggerfall's dungeons leave open: the
+    /// saved ones if they were learned from this game data, otherwise learned
+    /// afresh on a background thread (it takes a while).
+    fn start_learning_openings(&mut self, library: &Arena2Library) {
+        let folder = library.root().display().to_string();
+        if let Some(stored) = self
+            .stored_openings
+            .as_ref()
+            .filter(|stored| stored.folder == folder && stored.version == OpeningsLeftOpen::VERSION)
+        {
+            self.catalog.openings_left_open = Some(std::sync::Arc::new(stored.openings.clone()));
+            self.openings_job = None;
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let root = library.root().to_path_buf();
+        std::thread::spawn(move || match Arena2Library::open(&root) {
+            Ok(mut library) => {
+                let _ = sender.send(OpeningsLeftOpen::learn(&mut library));
+            }
+            Err(error) => log::warn!("could not learn the openings dungeons leave open: {error}"),
+        });
+        self.openings_job = Some((library.root().to_path_buf(), receiver));
+    }
+
+    /// Takes in the learned openings once the background thread has them.
+    fn poll_openings_job(&mut self, context: &egui::Context) {
+        let Some((folder, receiver)) = &self.openings_job else { return };
+        match receiver.try_recv() {
+            Ok(openings) => {
+                self.stored_openings = Some(StoredOpenings {
+                    folder: folder.display().to_string(),
+                    version: OpeningsLeftOpen::VERSION,
+                    openings: openings.clone(),
+                });
+                self.catalog.openings_left_open = Some(std::sync::Arc::new(openings));
+                self.openings_job = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                context.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.openings_job = None,
         }
     }
 
@@ -348,6 +440,7 @@ impl DungeonMakerApp {
         }
         // Store the open item's changes first, in case it is the one being reopened.
         self.set_workspace(Workspace::Empty, None);
+        self.fill_in_copied_location(id);
         let entry = self.project.find(id).cloned();
         let Some(library) = self.library.as_mut() else { return };
         match entry {
@@ -374,6 +467,28 @@ impl DungeonMakerApp {
                 self.show_dungeon(view, problems, OpenedItem::Project(id));
             }
             _ => {}
+        }
+    }
+
+    /// Gives project dungeon `id` the location type and entrance of the
+    /// Daggerfall dungeon it was copied from, if it has no location yet
+    /// (dungeons copied before dungeons had locations).
+    fn fill_in_copied_location(&mut self, id: ItemId) {
+        let Some(library) = self.library.as_mut() else { return };
+        let Some(dungeon) = self.project.dungeon_mut(id) else { return };
+        if dungeon.location != DungeonLocation::default() {
+            return;
+        }
+        let Some(original) = dungeon.based_on.as_deref() else { return };
+        let dungeons = library.dungeons();
+        let matching = |definition: &&DungeonDefinition| definition.name == original;
+        let definition = dungeons
+            .iter()
+            .filter(matching)
+            .find(|definition| definition.region_name == dungeon.region_name)
+            .or_else(|| dungeons.iter().find(matching));
+        if let Some(definition) = definition {
+            dungeon.location = DungeonLocation::copied_from(definition);
         }
     }
 
@@ -764,6 +879,7 @@ impl DungeonMakerApp {
                     dungeon_type: definition.dungeon_type,
                     based_on: Some(definition.name.clone()),
                     rooms: ProjectDungeonRoom::layout_of(definition),
+                    location: DungeonLocation::copied_from(definition),
                 })
             }
             OpenedItem::Project(_) => return None,
@@ -855,6 +971,12 @@ impl DungeonMakerApp {
     fn handle_panel_action(&mut self, action: PanelAction) {
         match action {
             PanelAction::Open(item) => self.open_item(&item),
+            PanelAction::Created(id) => {
+                if let Some(name) = self.project.find(id).map(|entry| entry.name().to_string()) {
+                    self.open_item(&OpenedItem::Project(id));
+                    self.status_message = format!("Created {name} in the project");
+                }
+            }
             PanelAction::CopyFromDaggerfall { item, folder, open } => {
                 if open && self.opened_item.as_ref() == Some(&item) {
                     self.convert_open_item_to_copy();
@@ -1098,6 +1220,13 @@ impl DungeonMakerApp {
             self.save_project_as();
             ui.close_menu();
         }
+        let export_response =
+            ui.add_enabled(self.can_open_dungeons(), egui::Button::new("Export to Daggerfall Unity…"));
+        if export_response.clicked() {
+            self.export_window.open();
+            ui.close_menu();
+        }
+        export_response.on_disabled_hover_text("Needs the game data, including MAPS.BSA");
         ui.separator();
         let has_library = self.library.is_some();
         if ui.add_enabled(has_library, egui::Button::new("Open cell…").shortcut_text("Ctrl+O")).clicked() {
@@ -1164,6 +1293,10 @@ impl DungeonMakerApp {
             show_centered_hint(context, "Choose your ARENA2 folder to begin.");
             return;
         };
+        let (world, daggerfall_dungeons) = match &self.workspace {
+            Workspace::Dungeon(_) => (library.world_map(), Some(library.dungeons())),
+            _ => (None, None),
+        };
         let mut resources = EditorResources {
             library,
             render_state: self.render_state.as_ref(),
@@ -1174,6 +1307,9 @@ impl DungeonMakerApp {
 
         let mut room_to_open = None;
         let mut properties_action = None;
+        let mut added_room = None;
+        let mut deleted_room = None;
+        let mut moved_room = None;
         match &mut self.workspace {
             Workspace::Room(editor) => {
                 editor.set_used_in(std::mem::take(&mut main_used_in));
@@ -1194,18 +1330,69 @@ impl DungeonMakerApp {
                     Some(OpenedItem::Project(id)) => self.project.dungeon(id),
                     _ => None,
                 };
+                let daggerfall_dungeons = daggerfall_dungeons.as_deref().unwrap_or_default();
+                let location = match (open_dungeon, &self.opened_item) {
+                    (Some(dungeon), _) => dungeon.location.clone(),
+                    (None, Some(OpenedItem::DaggerfallDungeon(index))) => daggerfall_dungeons
+                        .get(*index)
+                        .map(|definition| DungeonLocation {
+                            map_pixel: definition.map_pixel,
+                            ..DungeonLocation::copied_from(definition)
+                        })
+                        .unwrap_or_default(),
+                    _ => DungeonLocation::default(),
+                };
+                let other_dungeons = self.project.placed_dungeons(open_dungeon.map(|dungeon| dungeon.id));
+                // The song the game plays there unless another is chosen: a Daggerfall
+                // dungeon's own, or that of the dungeon a project dungeon replaces.
+                let game_definition = match (open_dungeon, &self.opened_item) {
+                    (Some(dungeon), _) => dungeon.location.replaces.as_ref().and_then(|replaced| {
+                        daggerfall_dungeons.iter().find(|definition| replaced.is(definition))
+                    }),
+                    (None, Some(OpenedItem::DaggerfallDungeon(index))) => daggerfall_dungeons.get(*index),
+                    _ => None,
+                };
+                let game_song = game_definition.and_then(|definition| {
+                    let classic = definition.classic?;
+                    Some(crate::music::song_for_seed(classic.dungeon_music_seed, definition.region_index))
+                });
                 let details = DungeonDetails {
                     read_only: open_dungeon.is_none(),
                     based_on: open_dungeon.and_then(|dungeon| dungeon.based_on.as_deref()),
                     project: &self.project,
                     custom_names: resources.custom_names,
+                    location: location.clone(),
+                    world: world.as_deref(),
+                    other_dungeons: &other_dungeons,
+                    daggerfall_dungeons,
+                    game_song,
                 };
                 properties_action = view.show_properties(context, &details);
+                let windows_request = LocationWindowsRequest {
+                    read_only: open_dungeon.is_none(),
+                    location: &location,
+                    world: world.as_deref(),
+                    other_dungeons: &other_dungeons,
+                    daggerfall_dungeons,
+                };
+                if let Some(action) = view.show_location_windows(context, &windows_request, &mut resources) {
+                    properties_action = Some(action);
+                }
+                let project = &self.project;
                 egui::CentralPanel::default().frame(egui::Frame::none()).show(context, |ui| {
-                    room_to_open = view.show(ui, &mut resources);
+                    room_to_open = view.show(ui, &mut resources, project);
                 });
                 if let Some(room_index) = view.take_make_start_request() {
                     properties_action = Some(DungeonPropertiesAction::MakeStart(room_index));
+                }
+                if let Some(placement) = view.take_add_room_request() {
+                    added_room = Some(placement);
+                }
+                if let Some(room_index) = view.take_delete_room_request() {
+                    deleted_room = Some(room_index);
+                }
+                if let Some(request) = view.take_move_room_request() {
+                    moved_room = Some(request);
                 }
             }
             Workspace::Empty => show_centered_hint(
@@ -1218,6 +1405,15 @@ impl DungeonMakerApp {
         }
         if let Some(action) = properties_action {
             self.handle_dungeon_properties_action(context, action);
+        }
+        if let Some(placement) = added_room {
+            self.add_room_to_open_dungeon(placement);
+        }
+        if let Some(room_index) = deleted_room {
+            self.delete_room_from_open_dungeon(room_index);
+        }
+        if let Some((room_index, from, to)) = moved_room {
+            self.move_room_in_open_dungeon(room_index, from, to);
         }
         // Load the surrounding cells of a dungeon newly selected under "Used in".
         if let Some((dungeon, home)) = context_request {
@@ -1252,8 +1448,59 @@ impl DungeonMakerApp {
                 self.status_message = format!("{} is now a {}", dungeon.name, dungeon_type.name());
             }
             (DungeonPropertiesAction::OpenRoom(room_index), _) => self.open_room_window(context, room_index),
+            (DungeonPropertiesAction::PlaySong(song), _) => {
+                let data = match self.library.as_ref().map(|library| library.midi_song(song.file)) {
+                    Some(Ok(data)) => data,
+                    Some(Err(error)) => {
+                        self.error_message = Some(format!("Could not play {}: {error}", song.label()));
+                        return;
+                    }
+                    None => return,
+                };
+                if let Workspace::Dungeon(view) = &mut self.workspace {
+                    if let Err(error) = view.play_song(song, &data) {
+                        self.error_message = Some(error);
+                    }
+                }
+                // Show Stop straight away.
+                context.request_repaint();
+            }
             (DungeonPropertiesAction::MakeStart(room_index), Some(_)) => self.make_start_room(room_index),
-            (DungeonPropertiesAction::MakeStart(_), None) if self.copy_prompt.is_none() => {
+            (DungeonPropertiesAction::SetLocation(location), Some(dungeon)) => {
+                // The dungeon belongs to the region of its spot on the map, or to
+                // that of the dungeon it replaces.
+                let region = match &location.replaces {
+                    Some(replaced) => Some(replaced.region_index),
+                    None => location
+                        .map_pixel
+                        .zip(self.library.as_mut().and_then(|library| library.world_map()))
+                        .and_then(|(pixel, world)| world.region_at(pixel)),
+                };
+                if location.map_pixel != dungeon.location.map_pixel
+                    || location.replaces != dungeon.location.replaces
+                {
+                    match (&location.replaces, location.map_pixel) {
+                        (Some(replaced), _) => {
+                            self.status_message =
+                                format!("{} now replaces {}", dungeon.name, replaced.label());
+                        }
+                        (None, Some(pixel)) => {
+                            self.status_message = format!("{} is now at {pixel}", dungeon.name)
+                        }
+                        (None, None) => {}
+                    }
+                }
+                if let Some(region_index) = region {
+                    dungeon.region_name = crate::arena2::region_name(region_index).to_string();
+                    if let Workspace::Dungeon(view) = &mut self.workspace {
+                        view.region_name = dungeon.region_name.clone();
+                    }
+                }
+                dungeon.location = location;
+            }
+            (DungeonPropertiesAction::MakeStart(_) | DungeonPropertiesAction::SetLocation(_), None)
+                if self.copy_prompt.is_none() =>
+            {
                 self.copy_prompt = Some(CopyPrompt { subject: CopySubject::Dungeon, viewport: None });
             }
             (DungeonPropertiesAction::EditBlocked, _) if self.copy_prompt.is_none() => {
@@ -1261,6 +1508,104 @@ impl DungeonMakerApp {
             }
             _ => {}
         }
+    }
+
+    /// Adds the cell `placement` (dropped into the dungeon view) to the open
+    /// dungeon. A Daggerfall dungeon cannot be changed, so the user is asked to
+    /// copy it first.
+    fn add_room_to_open_dungeon(&mut self, placement: ProjectDungeonRoom) {
+        let Some(OpenedItem::Project(id)) = self.opened_item else {
+            if self.copy_prompt.is_none() {
+                self.copy_prompt = Some(CopyPrompt { subject: CopySubject::Dungeon, viewport: None });
+            }
+            return;
+        };
+        let Some(dungeon) = self.project.dungeon_mut(id) else { return };
+        dungeon.rooms.push(placement.clone());
+        let layout_index = dungeon.rooms.len() - 1;
+        let (Workspace::Dungeon(view), Some(library)) = (&mut self.workspace, self.library.as_mut()) else {
+            return;
+        };
+        match view.add_room(&placement, layout_index, &self.project, library) {
+            Ok(()) => {
+                self.status_message =
+                    format!("Added {} at {}, {}", placement.block_name, placement.grid_x, placement.grid_z);
+            }
+            Err(error) => {
+                self.error_message = Some(format!("Could not add {}: {error}", placement.block_name))
+            }
+        }
+    }
+
+    /// Moves room `room_index` (dragged in the dungeon view from grid spot
+    /// `from`) to grid spot `spot` in the open dungeon. A Daggerfall dungeon
+    /// cannot be changed, so the cell goes back and the user is asked to copy
+    /// the dungeon first.
+    fn move_room_in_open_dungeon(&mut self, room_index: usize, from: (i32, i32), spot: (i32, i32)) {
+        let project_dungeon = match self.opened_item {
+            Some(OpenedItem::Project(id)) => Some(id),
+            _ => None,
+        };
+        let Workspace::Dungeon(view) = &mut self.workspace else { return };
+        let Some(layout_index) = view.layout_index(room_index) else { return };
+        let placement = project_dungeon
+            .and_then(|id| self.project.dungeon_mut(id))
+            .and_then(|dungeon| dungeon.rooms.get_mut(layout_index));
+        let Some(placement) = placement else {
+            // Not a project dungeon: put the cell back where it was.
+            view.set_room_spot(room_index, from);
+            if self.copy_prompt.is_none() {
+                self.copy_prompt = Some(CopyPrompt { subject: CopySubject::Dungeon, viewport: None });
+            }
+            return;
+        };
+        placement.grid_x = spot.0;
+        placement.grid_z = spot.1;
+        self.status_message = format!("Moved {} to {}, {}", placement.block_name, spot.0, spot.1);
+    }
+
+    /// Takes room `room_index` (pressed Delete on in the dungeon view) out of
+    /// the open dungeon. A project cell it used stays in the project. A
+    /// Daggerfall dungeon cannot be changed, so the user is asked to copy it first.
+    fn delete_room_from_open_dungeon(&mut self, room_index: usize) {
+        let Some(OpenedItem::Project(id)) = self.opened_item else {
+            if self.copy_prompt.is_none() {
+                self.copy_prompt = Some(CopyPrompt { subject: CopySubject::Dungeon, viewport: None });
+            }
+            return;
+        };
+        // Edits to the dungeon's cells are kept before the layout changes under them.
+        self.store_workspace_changes();
+        let Workspace::Dungeon(view) = &mut self.workspace else { return };
+        let Some(layout_index) = view.layout_index(room_index) else { return };
+        let Some(dungeon) = self.project.dungeon_mut(id) else { return };
+        if layout_index >= dungeon.rooms.len() {
+            return;
+        }
+        let placement = dungeon.rooms.remove(layout_index);
+        view.remove_room(room_index);
+
+        // The deleted cell's window closes; the windows of later cells follow them up one place.
+        if let Some(render_state) = self.render_state.as_ref() {
+            for window in
+                self.room_windows.iter_mut().filter(|window| window.dungeon_room_index == Some(room_index))
+            {
+                window.editor.release(render_state);
+            }
+        }
+        self.room_windows.retain(|window| window.dungeon_room_index != Some(room_index));
+        for window in &mut self.room_windows {
+            if let Some(index) = window.dungeon_room_index.as_mut().filter(|index| **index > room_index) {
+                *index -= 1;
+            }
+        }
+
+        let name = match placement.room.and_then(|room_id| self.project.room(room_id)) {
+            Some(room) => format!("{} (it stays in the project)", room.name),
+            None => placement.block_name.clone(),
+        };
+        let start = if placement.is_starting_block { "; the dungeon has no start cell now" } else { "" };
+        self.status_message = format!("Removed {name} from the dungeon{start}");
     }
 
     /// Makes room `room_index` of the open project dungeon its starting cell,
@@ -1498,6 +1843,23 @@ impl DungeonMakerApp {
         }
     }
 
+    /// Draws the export window, and checks or exports when it asks.
+    fn show_export_window(&mut self, context: &egui::Context) {
+        let title = self.project_title();
+        let request = match self.export_window.needs_check() {
+            true => Some(ExportRequest::Check),
+            false => self.export_window.show(context, &mut self.project, &title),
+        };
+        let Some(request) = request else { return };
+        // Edits in the open cell or dungeon count.
+        self.store_workspace_changes();
+        let Some(library) = self.library.as_mut() else { return };
+        match request {
+            ExportRequest::Check => self.export_window.run_checks(&self.project, library),
+            ExportRequest::Export => self.export_window.export(&mut self.project, library, &title),
+        }
+    }
+
     /// Draws the error popup, if there is an error to report.
     fn show_error_window(&mut self, context: &egui::Context) {
         let Some(message) = self.error_message.clone() else { return };
@@ -1535,6 +1897,7 @@ impl DungeonMakerApp {
 impl eframe::App for DungeonMakerApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(context);
+        self.poll_openings_job(context);
         self.handle_shortcuts(context);
         self.show_current_names();
         self.show_menu_bar(context);
@@ -1556,6 +1919,7 @@ impl eframe::App for DungeonMakerApp {
                 }
             }
         }
+        self.show_export_window(context);
         show_controls_window(context, &mut self.show_controls_window);
         self.show_room_windows(context);
         self.show_main_copy_prompt(context);
@@ -1573,6 +1937,11 @@ impl eframe::App for DungeonMakerApp {
             self.project_path.as_deref().map(|path| path.display().to_string()).unwrap_or_default();
         storage.set_string(PROJECT_FILE_STORAGE_KEY, project_file);
         eframe::set_value(storage, CUSTOM_NAMES_STORAGE_KEY, &self.custom_names);
+        eframe::set_value(storage, PANEL_VIEW_STORAGE_KEY, &self.project_panel.view);
+        eframe::set_value(storage, EXPORT_SETTINGS_STORAGE_KEY, &self.export_window.settings);
+        if let Some(openings) = &self.stored_openings {
+            eframe::set_value(storage, OPENINGS_STORAGE_KEY, openings);
+        }
     }
 }
 
@@ -1697,24 +2066,27 @@ fn show_centered_hint(context: &egui::Context, hint: &str) {
 
 /// Draws the viewport controls help window.
 fn show_controls_window(context: &egui::Context, is_open: &mut bool) {
-    const CONTROLS: [(&str, &str); 20] = [
+    const CONTROLS: [(&str, &str); 23] = [
         ("Hover a cell (dungeon view)", "Highlight the whole cell"),
         ("Double-click a cell (dungeon view)", "Open it in a cell editor window"),
         ("Click an asset tile", "Arm that asset for placement"),
         ("Left click (while placing)", "Place the asset; hold Shift to keep placing"),
-        ("R / Esc (while placing)", "Rotate the asset 90° / stop placing"),
+        ("Q / E or R (while placing)", "Turn the asset 90° anticlockwise / clockwise"),
+        ("Alt (while placing)", "Place without snapping to open faces"),
+        ("Esc (while placing)", "Stop placing"),
         ("Left click", "Select object"),
         ("Left drag on arrow", "Move selection along that axis"),
+        ("Left drag on ring", "Turn the selected object around that axis (15° steps with grid lock)"),
         ("G", "Turn grid lock on or off"),
         ("Ctrl while dragging", "Switch grid lock for that drag"),
         ("Right drag", "Orbit"),
         ("Middle drag / Shift + right drag", "Pan"),
         ("Mouse wheel", "Zoom"),
-        ("Right mouse + W A S D", "Fly forward / left / back / right"),
-        ("Right mouse + Q / E", "Fly down / up (hold Shift to go faster)"),
+        ("W A S D", "Move forward / left / back / right along the ground (hold Shift to go faster)"),
+        ("Space / Ctrl", "Raise / lower the camera (also Right mouse + E / Q)"),
         ("F", "Frame selection"),
         ("Home", "Frame cell or dungeon"),
-        ("R / Shift + R", "Rotate selection 90° clockwise / anticlockwise"),
+        ("E or R / Q or Shift + R", "Turn the selected object 90° clockwise / anticlockwise"),
         ("Ctrl + D", "Duplicate selection"),
         ("Delete", "Delete selection"),
         ("Ctrl + Z / Ctrl + Y", "Undo / redo"),

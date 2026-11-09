@@ -18,7 +18,7 @@ const DISTANCE_RANGE: (f32, f32) = (0.25, 5000.0);
 const ZOOM_SENSITIVITY: f32 = 0.004;
 
 /// A camera orbiting around [`OrbitCamera::target`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrbitCamera {
     /// Point the camera looks at and orbits around.
     pub target: Vec3,
@@ -98,10 +98,12 @@ impl OrbitCamera {
         self.distance = (self.distance * scale).clamp(DISTANCE_RANGE.0, DISTANCE_RANGE.1);
     }
 
-    /// Moves the target relative to the view: `x` right, `y` up, `z` forward.
-    pub fn fly(&mut self, local_offset: Vec3) {
-        self.target +=
-            self.right() * local_offset.x + Vec3::Y * local_offset.y + self.forward() * local_offset.z;
+    /// Moves the target along the ground relative to where the camera faces:
+    /// `x` right, `y` up, `z` forward. Forward stays level however the camera
+    /// is tilted, so walking never climbs or sinks.
+    pub fn walk(&mut self, local_offset: Vec3) {
+        let forward = Vec3::new(self.yaw.sin(), 0.0, self.yaw.cos());
+        self.target += self.right() * local_offset.x + Vec3::Y * local_offset.y + forward * local_offset.z;
     }
 
     /// Positions the camera so the box between `minimum` and `maximum` fills the view.

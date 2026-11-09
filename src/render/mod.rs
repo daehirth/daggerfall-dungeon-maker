@@ -127,6 +127,8 @@ pub struct FrameRequest<'frame> {
     pub placement_preview: Option<&'frame SceneObject>,
     /// Water surfaces to draw, each the corner of a cell's square at its water height.
     pub water_planes: &'frame [Vec3],
+    /// Squares of ground to draw: each one's minimum corner and side, in world units.
+    pub ground_squares: &'frame [(Vec3, f32)],
     /// Objects drawn faded for context only, such as the cells around the edited
     /// one in a dungeon. They are never highlighted or picked.
     pub context_scene: Option<&'frame Scene>,
@@ -472,7 +474,8 @@ impl SceneRenderer {
 
         let lines = build_helper_lines(library, request);
         self.line_vertex_buffer.write(device, queue, bytemuck::cast_slice(&lines.vertices));
-        let water = water_vertices(request.water_planes);
+        let mut water = ground_vertices(request.ground_squares);
+        water.extend(water_vertices(request.water_planes));
         self.water_vertex_buffer.write(device, queue, bytemuck::cast_slice(&water));
 
         let mut encoder = device
@@ -801,6 +804,23 @@ fn build_helper_lines(library: &mut Arena2Library, request: &FrameRequest<'_>) -
 const WATER_COLOR: [f32; 4] = [0.2, 0.5, 1.0, 0.28];
 /// Colour of the edge of a water surface.
 const WATER_EDGE_COLOR: Vec4 = Vec4::new(0.35, 0.65, 1.0, 1.0);
+
+/// Colour of the ground under a location's preview: a muted grass green.
+const GROUND_COLOR: [f32; 4] = [0.035, 0.055, 0.025, 1.0];
+
+/// Two triangles for each square of ground.
+fn ground_vertices(squares: &[(Vec3, f32)]) -> Vec<LineVertex> {
+    squares
+        .iter()
+        .flat_map(|&(corner, side)| {
+            let at = |x: f32, z: f32| LineVertex {
+                position: (corner + Vec3::new(x, 0.0, z)).to_array(),
+                color: GROUND_COLOR,
+            };
+            [at(0.0, 0.0), at(side, 0.0), at(side, side), at(0.0, 0.0), at(side, side), at(0.0, side)]
+        })
+        .collect()
+}
 
 /// Two triangles for each water surface, covering a cell's square at water height.
 fn water_vertices(planes: &[Vec3]) -> Vec<LineVertex> {

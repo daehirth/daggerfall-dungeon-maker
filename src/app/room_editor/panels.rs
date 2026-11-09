@@ -35,7 +35,11 @@ impl RoomEditor {
                 match &self.project_room_name {
                     Some(name) => {
                         ui.heading(name);
-                        ui.label(egui::RichText::new(format!("Copy of {}", self.scene.block_name)).weak());
+                        let source = match self.scene.block_name.as_str() {
+                            "" => "New cell".to_string(),
+                            block_name => format!("Copy of {block_name}"),
+                        };
+                        ui.label(egui::RichText::new(source).weak());
                     }
                     None => {
                         ui.heading(&self.scene.block_name);
@@ -362,14 +366,18 @@ impl RoomEditor {
             ui.label(self.project_room_name.clone().unwrap_or_else(|| block_name.clone()));
             ui.end_row();
 
-            ui.label("Category").on_hover_text("Kind of cell, from the first letter of its block name: N interior, W interior with water, M interior variant, S special (quest), B border cap.");
-            let letter = block_name.chars().next().unwrap_or('?');
-            ui.label(format!("{letter} · {}", category_description(&block_name)));
-            ui.end_row();
+            // A new cell is not based on a Daggerfall block, so it has no category.
+            if !block_name.is_empty() {
+                ui.label("Category").on_hover_text("Kind of cell, from the first letter of its block name: N interior, W interior with water, M interior variant, S special (quest), B border cap.");
+                let letter = block_name.chars().next().unwrap_or('?');
+                ui.label(format!("{letter} · {}", category_description(&block_name)));
+                ui.end_row();
+            }
 
             ui.label("Source").on_hover_text("Where the cell comes from: Daggerfall's own data (read-only), or a copy in your project.");
             match (self.read_only, self.project_room_name.is_some()) {
                 (true, _) => ui.label("Daggerfall (read-only)"),
+                (false, true) if block_name.is_empty() => ui.label("New cell in your project"),
                 (false, true) => ui.label(format!("Copy of {block_name}")),
                 (false, false) => ui.label("Daggerfall"),
             };

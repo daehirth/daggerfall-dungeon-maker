@@ -1,18 +1,22 @@
-//! The project panel: every room and dungeon that can be opened, in one tree.
+//! The project panel: every room and dungeon that can be opened.
 //!
-//! The **Daggerfall** list holds the game's own dungeons (grouped by region)
-//! and rooms; they open read-only. Below it are the project's own rooms and
-//! dungeons: loose at the top level, or in folders the user creates.
+//! A switch at the top shows either **Dungeons** or **Cells** (rooms), and a
+//! toggle shows or hides Daggerfall's own. The **Daggerfall** list holds the
+//! game's own dungeons (grouped by region) or rooms; they open read-only.
+//! Below it are the project's own: loose at the top level, or in folders the
+//! user creates (folders show in both, with what they hold of each kind).
 //! Right-clicking an entry offers what can be done with it.
 //!
 //! Entries can also be dragged: onto a folder to move them into it, onto an
 //! entry to place them just before it, or onto the space below the list to move
 //! them to the top level. Dragging a Daggerfall room or dungeon into the project
-//! adds a copy there.
+//! adds a copy there. A cell (the project's or Daggerfall's) can also be dragged
+//! into the dungeon view, which adds it to the open dungeon.
 
 use std::sync::Arc;
 
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use super::room_browser::category_description;
 use crate::arena2::DungeonDefinition;
@@ -48,13 +52,15 @@ pub enum PanelAction {
         open: bool,
     },
     Duplicate(ItemId),
+    /// A new, empty room or dungeon was added to the project; open it.
+    Created(ItemId),
     /// Delete a room or dungeon (the application asks first).
     Delete(ItemId),
 }
 
-/// What is being dragged in the panel.
+/// What is being dragged from the panel.
 #[derive(Debug, Clone, PartialEq)]
-enum DragPayload {
+pub(super) enum DragPayload {
     /// A project room, dungeon or folder.
     Project(ItemId),
     /// A Daggerfall room or dungeon, which is copied where it is dropped.
@@ -85,10 +91,47 @@ struct RegionGroup {
     dungeons: std::ops::Range<usize>,
 }
 
+/// Which kind of item the panel lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum PanelSection {
+    #[default]
+    Dungeons,
+    Cells,
+}
+
+impl PanelSection {
+    /// The section listing `entry`, or `None` for folders, which show in both.
+    fn of(entry: &ProjectEntry) -> Option<Self> {
+        match entry {
+            ProjectEntry::Room(_) => Some(Self::Cells),
+            ProjectEntry::Dungeon(_) => Some(Self::Dungeons),
+            ProjectEntry::Folder(_) => None,
+        }
+    }
+}
+
+/// What the panel shows, remembered between runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanelView {
+    pub section: PanelSection,
+    /// Whether Daggerfall's own dungeons or cells are listed above the project's.
+    pub show_daggerfall: bool,
+}
+
+impl Default for PanelView {
+    fn default() -> Self {
+        Self { section: PanelSection::default(), show_daggerfall: true }
+    }
+}
+
 /// State of the project panel.
 pub struct ProjectPanel {
     /// Whether the panel is shown.
     pub is_open: bool,
+    /// The section shown and whether Daggerfall's items are listed.
+    pub view: PanelView,
+    /// The item open when the panel was last drawn, to switch to its section when another opens.
+    last_opened: Option<OpenedItem>,
     search_text: String,
     /// Entry being renamed and the name typed so far.
     renaming: Option<(ItemId, String)>,
@@ -103,6 +146,8 @@ impl Default for ProjectPanel {
     fn default() -> Self {
         Self {
             is_open: true,
+            view: PanelView::default(),
+            last_opened: None,
             search_text: String::new(),
             renaming: None,
             focus_rename_field: false,
@@ -129,6 +174,31 @@ impl ProjectPanel {
         self.dungeons = dungeons;
     }
 
+    /// Why a new item of the section shown cannot be called `name`, if it cannot:
+    /// the name is taken by something in the project, or by one of Daggerfall's
+    /// own dungeons or cells of the same kind.
+    fn new_item_problem(&self, project: &Project, name: &str) -> Option<String> {
+        if name.is_empty() {
+            return None;
+        }
+        if project.has_item_named(name) {
+            return Some(format!("Your project already has something called \"{name}\""));
+        }
+        let taken_in_daggerfall = match self.view.section {
+            PanelSection::Dungeons => {
+                self.dungeons.iter().any(|dungeon| dungeon.name.eq_ignore_ascii_case(name))
+            }
+            PanelSection::Cells => self.room_names.iter().any(|block| {
+                block.eq_ignore_ascii_case(name) || block.trim_end_matches(".RDB").eq_ignore_ascii_case(name)
+            }),
+        };
+        let kind = match self.view.section {
+            PanelSection::Dungeons => "dungeon",
+            PanelSection::Cells => "cell",
+        };
+        taken_in_daggerfall.then(|| format!("Daggerfall already has a {kind} called \"{name}\""))
+    }
+
     /// Starts renaming the entry `id`, for example a folder that was just created.
     pub fn start_renaming(&mut self, id: ItemId, current_name: &str) {
         self.renaming = Some((id, current_name.to_string()));
@@ -150,6 +220,21 @@ impl ProjectPanel {
         let mut action = None;
         let mut changes = Vec::new();
 
+        // Opening something of the other kind (from a menu, a link or a cell
+        // window) switches to its section, so it shows highlighted.
+        if opened != self.last_opened.as_ref() {
+            self.last_opened = opened.cloned();
+            let section = match opened {
+                Some(OpenedItem::DaggerfallDungeon(_)) => Some(PanelSection::Dungeons),
+                Some(OpenedItem::DaggerfallRoom(_)) => Some(PanelSection::Cells),
+                Some(OpenedItem::Project(id)) => project.find(*id).and_then(PanelSection::of),
+                None => None,
+            };
+            if let Some(section) = section {
+                self.view.section = section;
+            }
+        }
+
         egui::SidePanel::left("project_panel").resizable(true).default_width(250.0).show(context, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(project_title);
@@ -159,43 +244,101 @@ impl ProjectPanel {
                     }
                 });
             });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search_text)
-                    .hint_text("Search cells and dungeons")
-                    .desired_width(f32::INFINITY),
-            );
+            ui.horizontal(|ui| {
+                for (section, name, hover) in [
+                    (PanelSection::Dungeons, "Dungeons", "List dungeons"),
+                    (PanelSection::Cells, "Cells", "List cells (the blocks dungeons are built from)"),
+                ] {
+                    let selected = self.view.section == section;
+                    let text = egui::RichText::new(name).strong();
+                    if ui.selectable_label(selected, text).on_hover_text(hover).clicked() {
+                        self.view.section = section;
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let hover = "Show or hide Daggerfall's own dungeons and cells above your project's";
+                    toggle_switch(ui, &mut self.view.show_daggerfall).on_hover_text(hover);
+                    ui.label("Daggerfall").on_hover_text(hover);
+                });
+            });
+            let (hint, kind) = match self.view.section {
+                PanelSection::Dungeons => ("Search, or name a new dungeon", "dungeon"),
+                PanelSection::Cells => ("Search, or name a new cell", "cell"),
+            };
+            ui.horizontal(|ui| {
+                // The + button sits at the right; the search field takes the rest of the row.
+                let button_width = ui.spacing().interact_size.y + ui.spacing().button_padding.x;
+                let field_width = ui.available_width() - button_width - ui.spacing().item_spacing.x;
+                // An exact size, so the field never widens the panel.
+                let field = ui.add_sized(
+                    [field_width.max(40.0), ui.spacing().interact_size.y],
+                    egui::TextEdit::singleline(&mut self.search_text).hint_text(hint),
+                );
+                let name = self.search_text.trim().to_string();
+                let problem = self.new_item_problem(project, &name);
+                let can_create = !name.is_empty() && problem.is_none();
+                let button = ui
+                    .add_enabled(can_create, egui::Button::new(egui::RichText::new("+").strong()))
+                    .on_hover_text(format!("Create an empty {kind} called \"{name}\" (or press Enter)"))
+                    .on_disabled_hover_text(
+                        problem.unwrap_or_else(|| format!("Type a name to create an empty {kind} with it")),
+                    );
+                let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if can_create && (button.clicked() || entered) {
+                    let id = match self.view.section {
+                        PanelSection::Dungeons => project.add_empty_dungeon(&name),
+                        PanelSection::Cells => project.add_empty_room(&name),
+                    };
+                    self.search_text.clear();
+                    action = Some(PanelAction::Created(id));
+                }
+            });
             ui.separator();
 
             let search = self.search_text.trim().to_lowercase();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                self.show_daggerfall_list(ui, &search, custom_names, opened, &mut action);
-                let folders = project.folders();
-                let context = TreeContext { search: &search, opened, folders: &folders, project };
-                for entry in folders_first(&project.entries) {
-                    self.show_entry(ui, entry, &context, &mut action, &mut changes);
-                }
-                if project.is_empty() && search.is_empty() {
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Your cells and dungeons appear here. Edit anything from Daggerfall to make a copy.",
-                        )
-                        .weak(),
-                    );
-                }
+            let section = self.view.section;
+            egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt(("project_panel_list", section)).show(
+                ui,
+                |ui| {
+                    if self.view.show_daggerfall {
+                        self.show_daggerfall_list(ui, section, &search, custom_names, opened, &mut action);
+                    }
+                    let folders = project.folders();
+                    let context = TreeContext { search: &search, section, opened, folders: &folders, project };
+                    if self.view.show_daggerfall {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Your project").strong());
+                    }
+                    for entry in folders_first(&project.entries) {
+                        self.show_entry(ui, entry, &context, &mut action, &mut changes);
+                    }
+                    let has_any = project.entries.iter().any(|entry| entry_holds(entry, section));
+                    if !has_any && search.is_empty() {
+                        ui.add_space(6.0);
+                        let hint = match section {
+                            PanelSection::Dungeons => {
+                                "Your dungeons appear here. Change one of Daggerfall's dungeons to make a copy."
+                            }
+                            PanelSection::Cells => {
+                                "Your cells appear here. Change one of Daggerfall's cells to make a copy."
+                            }
+                        };
+                        ui.label(egui::RichText::new(hint).weak());
+                    }
                 // Leave room below the last entry to right-click, or to drop entries at the top level.
                 let rest = ui.allocate_response(
                     egui::vec2(ui.available_width(), ui.available_height().max(40.0)),
                     egui::Sense::click(),
                 );
                 drop_target(ui, &rest, DropTarget::Into(None), DropHighlight::Area, &mut changes);
-                rest.context_menu(|ui| {
-                    if ui.button("New folder").clicked() {
-                        changes.push(TreeChange::NewFolder(None));
-                        ui.close_menu();
-                    }
-                });
-            });
+                    rest.context_menu(|ui| {
+                        if ui.button("New folder").clicked() {
+                            changes.push(TreeChange::NewFolder(None));
+                            ui.close_menu();
+                        }
+                    });
+                },
+            );
         });
 
         show_drag_preview(context, project, &self.dungeons);
@@ -240,10 +383,11 @@ impl ProjectPanel {
         }
     }
 
-    /// Draws the read-only list of Daggerfall's own dungeons and rooms.
+    /// Draws the read-only list of Daggerfall's own dungeons or rooms.
     fn show_daggerfall_list(
         &self,
         ui: &mut egui::Ui,
+        section: PanelSection,
         search: &str,
         custom_names: &CustomNames,
         opened: Option<&OpenedItem>,
@@ -264,56 +408,60 @@ impl ProjectPanel {
         // Search results are a flat list, so the folded state of the lists is left as the user had it.
         if !search.is_empty() {
             ui.strong("Daggerfall");
-            ui.indent("daggerfall_matches", |ui| {
-                ui.label("Dungeons");
-                let dungeon_matches = (0..self.dungeons.len()).filter(|&index| {
-                    let dungeon = &self.dungeons[index];
-                    dungeon.name.to_lowercase().contains(search)
-                        || dungeon.region_name.to_lowercase().contains(search)
-                });
-                ui.indent("daggerfall_dungeon_matches", |ui| {
+            ui.indent("daggerfall_matches", |ui| match section {
+                PanelSection::Dungeons => {
+                    let dungeon_matches = (0..self.dungeons.len()).filter(|&index| {
+                        let dungeon = &self.dungeons[index];
+                        dungeon.name.to_lowercase().contains(search)
+                            || dungeon.region_name.to_lowercase().contains(search)
+                    });
                     show_limited(ui, dungeon_matches, |ui, index| {
                         self.show_daggerfall_dungeon(ui, index, true, opened, action);
                     });
-                });
-                ui.label("Cells");
-                let room_matches = self.room_names.iter().filter(|name| {
-                    name.to_lowercase().contains(search) || custom_names.room_name_matches(name, search)
-                });
-                ui.indent("daggerfall_room_matches", |ui| {
+                }
+                PanelSection::Cells => {
+                    let room_matches = self.room_names.iter().filter(|name| {
+                        name.to_lowercase().contains(search) || custom_names.room_name_matches(name, search)
+                    });
                     show_limited(ui, room_matches, |ui, name| {
                         show_daggerfall_room(ui, name, custom_names, opened, action);
                     });
-                });
+                }
             });
             return;
         }
 
-        egui::CollapsingHeader::new("Daggerfall").id_salt("daggerfall_list").default_open(true).show(
-            ui,
-            |ui| {
-                let dungeon_header = format!("Dungeons ({})", self.dungeons.len());
-                egui::CollapsingHeader::new(dungeon_header).id_salt("daggerfall_dungeons").show(ui, |ui| {
-                    for region in &self.regions {
-                        let header = format!("{} ({})", region.name, region.dungeons.len());
-                        egui::CollapsingHeader::new(header).id_salt(("daggerfall_region", region.name)).show(
-                            ui,
-                            |ui| {
-                                for index in region.dungeons.clone() {
-                                    self.show_daggerfall_dungeon(ui, index, false, opened, action);
-                                }
-                            },
-                        );
-                    }
-                });
-                let room_header = format!("Cells ({})", self.room_names.len());
-                egui::CollapsingHeader::new(room_header).id_salt("daggerfall_rooms").show(ui, |ui| {
-                    for name in &self.room_names {
-                        show_daggerfall_room(ui, name, custom_names, opened, action);
-                    }
-                });
-            },
-        );
+        match section {
+            PanelSection::Dungeons => {
+                let header = format!("Daggerfall ({})", self.dungeons.len());
+                egui::CollapsingHeader::new(header).id_salt("daggerfall_dungeons").default_open(true).show(
+                    ui,
+                    |ui| {
+                        for region in &self.regions {
+                            let header = format!("{} ({})", region.name, region.dungeons.len());
+                            egui::CollapsingHeader::new(header)
+                                .id_salt(("daggerfall_region", region.name))
+                                .show(ui, |ui| {
+                                    for index in region.dungeons.clone() {
+                                        self.show_daggerfall_dungeon(ui, index, false, opened, action);
+                                    }
+                                });
+                        }
+                    },
+                );
+            }
+            PanelSection::Cells => {
+                let header = format!("Daggerfall ({})", self.room_names.len());
+                egui::CollapsingHeader::new(header).id_salt("daggerfall_rooms").default_open(true).show(
+                    ui,
+                    |ui| {
+                        for name in &self.room_names {
+                            show_daggerfall_room(ui, name, custom_names, opened, action);
+                        }
+                    },
+                );
+            }
+        }
     }
 
     /// Draws one Daggerfall dungeon row; `show_region` adds its region, for search results.
@@ -349,7 +497,7 @@ impl ProjectPanel {
         action: &mut Option<PanelAction>,
         changes: &mut Vec<TreeChange>,
     ) {
-        if !entry_matches(entry, context.search) {
+        if !entry_matches(entry, context.search, context.section) {
             return;
         }
         let id = entry.id();
@@ -487,6 +635,7 @@ impl ProjectPanel {
 /// What every project entry row needs to know.
 struct TreeContext<'tree> {
     search: &'tree str,
+    section: PanelSection,
     opened: Option<&'tree OpenedItem>,
     folders: &'tree [crate::project::FolderListing],
     project: &'tree Project,
@@ -574,15 +723,53 @@ fn move_to_menu(ui: &mut egui::Ui, id: ItemId, context: &TreeContext<'_>, change
     });
 }
 
-/// Whether `entry`, or anything inside it, matches the lowercase `search`.
-fn entry_matches(entry: &ProjectEntry, search: &str) -> bool {
-    if search.is_empty() || entry.name().to_lowercase().contains(search) {
-        return true;
-    }
+/// Whether `entry` shows in `section` with the lowercase `search`: a room or
+/// dungeon of that section whose name matches, or a folder holding one (or
+/// matching itself, as long as it is empty or holds something of the section).
+fn entry_matches(entry: &ProjectEntry, search: &str, section: PanelSection) -> bool {
+    let name_matches = search.is_empty() || entry.name().to_lowercase().contains(search);
     match entry {
-        ProjectEntry::Folder(folder) => folder.entries.iter().any(|child| entry_matches(child, search)),
-        _ => false,
+        ProjectEntry::Folder(folder) => {
+            let holds_section = folder.entries.is_empty() || entry_holds(entry, section);
+            (name_matches && holds_section)
+                || folder.entries.iter().any(|child| entry_matches(child, search, section))
+        }
+        _ => name_matches && PanelSection::of(entry) == Some(section),
     }
+}
+
+/// Whether `entry` is, or holds, a room or dungeon of `section`.
+fn entry_holds(entry: &ProjectEntry, section: PanelSection) -> bool {
+    match entry {
+        ProjectEntry::Folder(folder) => folder.entries.iter().any(|child| entry_holds(child, section)),
+        _ => PanelSection::of(entry) == Some(section),
+    }
+}
+
+/// An on/off switch, drawn as a sliding knob.
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let size = ui.spacing().interact_size.y * egui::vec2(1.8, 0.9);
+    let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, ""));
+    if ui.is_rect_visible(rect) {
+        let how_on = ui.ctx().animate_bool(response.id, *on);
+        let visuals = ui.style().interact_selectable(&response, *on);
+        let rect = rect.expand(visuals.expansion);
+        let radius = 0.5 * rect.height();
+        ui.painter().rect(rect, radius, visuals.bg_fill, visuals.bg_stroke);
+        let knob_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
+        ui.painter().circle(
+            egui::pos2(knob_x, rect.center().y),
+            0.75 * radius,
+            visuals.fg_stroke.color,
+            egui::Stroke::NONE,
+        );
+    }
+    response
 }
 
 /// Draws up to [`MAX_SEARCH_MATCHES`] rows, then says how many more there are.
@@ -672,4 +859,57 @@ fn show_drag_preview(context: &egui::Context, project: &Project, dungeons: &[Dun
         .show(context, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(name));
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::{DungeonLocation, ProjectDungeon, ProjectRoom};
+
+    fn room(project: &mut Project, name: &str) -> ProjectEntry {
+        ProjectEntry::Room(ProjectRoom {
+            id: project.new_id(),
+            name: name.into(),
+            based_on: None,
+            objects: Vec::new(),
+        })
+    }
+
+    fn dungeon(project: &mut Project, name: &str) -> ProjectEntry {
+        ProjectEntry::Dungeon(ProjectDungeon {
+            id: project.new_id(),
+            name: name.into(),
+            region_name: String::new(),
+            dungeon_type: None,
+            based_on: None,
+            rooms: Vec::new(),
+            location: DungeonLocation::default(),
+        })
+    }
+
+    #[test]
+    fn sections_show_their_own_kind_and_the_folders_holding_it() {
+        let mut project = Project::default();
+        let cells = project.add_folder("Cells only", None);
+        let entry = room(&mut project, "Great Hall");
+        project.add(entry, Some(cells));
+        let empty = project.add_folder("Empty", None);
+        let entry = dungeon(&mut project, "Hold");
+        project.add(entry, None);
+
+        let shown = |section: PanelSection, search: &str| -> Vec<&str> {
+            project
+                .entries
+                .iter()
+                .filter(|entry| entry_matches(entry, search, section))
+                .map(ProjectEntry::name)
+                .collect()
+        };
+        assert_eq!(shown(PanelSection::Cells, ""), ["Cells only", "Empty"]);
+        assert_eq!(shown(PanelSection::Dungeons, ""), ["Empty", "Hold"]);
+        assert_eq!(shown(PanelSection::Cells, "hall"), ["Cells only"]);
+        assert_eq!(shown(PanelSection::Dungeons, "hall"), Vec::<&str>::new());
+        assert_eq!(shown(PanelSection::Dungeons, "cells"), Vec::<&str>::new());
+        assert!(project.find(empty).is_some());
+    }
 }

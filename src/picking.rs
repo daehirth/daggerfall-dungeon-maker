@@ -2,7 +2,7 @@
 
 use glam::{Vec2, Vec3};
 
-use crate::arena2::Arena2Library;
+use crate::arena2::{Arena2Library, ModelMesh};
 use crate::scene::{Scene, SceneObject, SceneObjectKind};
 
 /// Radius of the clickable sphere around a light, in world units.
@@ -102,7 +102,16 @@ fn intersect_model(
     ignore_back_faces: bool,
 ) -> Option<f32> {
     let mesh = library.model(model_id)?;
+    intersect_mesh(object, &mesh, ray, ignore_back_faces)
+}
 
+/// Intersects `ray` with the triangles of `mesh` placed as `object`.
+pub fn intersect_mesh(
+    object: &SceneObject,
+    mesh: &ModelMesh,
+    ray: &Ray,
+    ignore_back_faces: bool,
+) -> Option<f32> {
     // Work in model space. The transform is rigid, so distances are preserved.
     let world_to_model = object.model_matrix().inverse();
     let local_ray = Ray {

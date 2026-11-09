@@ -1,10 +1,11 @@
-//! Names the user gives to rooms and models.
+//! Names the user gives to rooms and models, and the assets they marked as favourites.
 //!
 //! Daggerfall identifies rooms by file name (`N0000004.RDB`) and models by
 //! number (`70300`). Users can give either a name of their own, which the
 //! editor shows wherever that room or model appears. These names belong to the
 //! user, not to the game: they are saved with the application's settings and
-//! never written to the game data.
+//! never written to the game data. So are the user's favourite assets, which
+//! the asset palette lists on a tab of their own.
 
 use std::collections::BTreeMap;
 
@@ -20,9 +21,46 @@ pub struct CustomNames {
     room_names: BTreeMap<String, String>,
     /// Names of models, keyed by `ARCH3D.BSA` model id.
     model_names: BTreeMap<u32, String>,
+    /// Assets marked as favourites, in the order they were marked.
+    favorites: Vec<Favorite>,
+}
+
+/// An asset the user marked as a favourite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Favorite {
+    Model {
+        model_id: u32,
+    },
+    /// A flat or editor marker, by texture archive and record.
+    Flat {
+        archive: u16,
+        record: u8,
+    },
+    Light,
 }
 
 impl CustomNames {
+    /// The assets marked as favourites, in the order they were marked.
+    pub fn favorites(&self) -> &[Favorite] {
+        &self.favorites
+    }
+
+    /// Whether `favorite` is marked as a favourite.
+    pub fn is_favorite(&self, favorite: Favorite) -> bool {
+        self.favorites.contains(&favorite)
+    }
+
+    /// Marks `favorite` as a favourite, or unmarks it if it is one.
+    pub fn toggle_favorite(&mut self, favorite: Favorite) {
+        match self.favorites.iter().position(|existing| *existing == favorite) {
+            Some(position) => {
+                self.favorites.remove(position);
+            }
+            None => self.favorites.push(favorite),
+        }
+    }
+
     /// The user's name for the room `block_name`, if they gave it one.
     pub fn room_name(&self, block_name: &str) -> Option<&str> {
         self.room_names.get(block_name).map(|name| name.trim())

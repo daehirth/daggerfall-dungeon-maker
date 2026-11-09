@@ -33,6 +33,12 @@ rfd = "0.15"
 log = "0.4"
 env_logger = "0.11"
 
+# Previewing Daggerfall's music through the system's MIDI synthesizer. (On
+# Linux the song is handed to TiMidity or FluidSynth instead, so no ALSA
+# development files are needed to build.)
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+midir = "0.10"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
