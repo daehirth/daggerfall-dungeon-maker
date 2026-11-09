@@ -194,7 +194,7 @@ impl RoomEditor {
                     .selected_object
                     .and_then(|index| self.scene.objects.get(index).cloned().map(|object| (index, object)));
                 let Some((index, original)) = selected else {
-                    self.show_cell_properties(ui);
+                    self.show_cell_properties(ui, resources);
                     return;
                 };
 
@@ -348,7 +348,7 @@ impl RoomEditor {
 
     /// Shows the cell's own properties, when no object is selected. The water
     /// level and castle flag live on the cell's start marker and are edited there.
-    fn show_cell_properties(&mut self, ui: &mut egui::Ui) {
+    fn show_cell_properties(&mut self, ui: &mut egui::Ui, resources: &mut EditorResources<'_>) {
         ui.strong("Cell").on_hover_text(
             "The cell (RDB block) being edited. Select an object to see the object's own properties instead.",
         );
@@ -426,6 +426,39 @@ impl RoomEditor {
         if select_outside {
             self.select_objects(outside.clone());
             self.viewport.selection_changed_in_viewport = true;
+        }
+
+        // Jumping to the player's start and to the way out.
+        ui.add_space(8.0);
+        let exit_door = self.scene.objects.iter().position(SceneObject::is_exit_door);
+        let mut go_to = None;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(start_marker.is_some(), egui::Button::new("Go to Start"))
+                .on_hover_text(
+                    "Selects the cell's start marker, where the player enters, and moves the camera to it",
+                )
+                .on_disabled_hover_text("This cell has no start marker")
+                .clicked()
+            {
+                go_to = start_marker.map(|index| (index, "the start marker"));
+            }
+            if ui
+                .add_enabled(exit_door.is_some(), egui::Button::new("Go to Exit"))
+                .on_hover_text(
+                    "Selects the cell's exit door, which leaves the dungeon, and moves the camera to it",
+                )
+                .on_disabled_hover_text("This cell has no exit door; only a dungeon's start cell has one")
+                .clicked()
+            {
+                go_to = exit_door.map(|index| (index, "the exit door"));
+            }
+        });
+        if let Some((index, what)) = go_to {
+            self.select_objects(vec![index]);
+            self.viewport.selection_changed_in_viewport = true;
+            self.focus_selection(resources.library);
+            self.status_message = format!("Selected {what}");
         }
 
         if let (Some(index), Some(marker)) = (start_marker, edited_marker) {

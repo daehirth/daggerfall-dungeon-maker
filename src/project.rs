@@ -589,6 +589,53 @@ impl Project {
         });
     }
 
+    /// The entries saving the room or dungeon `id` saves: the item itself and,
+    /// for a dungeon, the project rooms it uses.
+    pub fn item_and_its_rooms(&self, id: ItemId) -> Vec<ItemId> {
+        let mut ids = vec![id];
+        if let Some(dungeon) = self.dungeon(id) {
+            for room_id in dungeon.rooms.iter().filter_map(|placement| placement.room) {
+                if !ids.contains(&room_id) {
+                    ids.push(room_id);
+                }
+            }
+        }
+        ids
+    }
+
+    /// Whether the room or dungeon `id` (with, for a dungeon, the rooms it
+    /// uses) differs from its copy in `saved`, or is not in `saved` at all.
+    pub fn item_differs_from(&self, saved: &Project, id: ItemId) -> bool {
+        self.item_and_its_rooms(id).into_iter().any(|id| self.find(id) != saved.find(id))
+    }
+
+    /// Whether the project's contents (everything saved in its file) are those of `other`.
+    pub fn same_contents(&self, other: &Project) -> bool {
+        self.entries == other.entries && self.mod_details == other.mod_details
+    }
+
+    /// `self` (the project as saved) with the room or dungeon `id` of `current`
+    /// saved into it, and for a dungeon the rooms it uses. Everything else stays
+    /// as it was saved. An entry new since then goes into its folder, if that
+    /// folder was saved, or at the top level.
+    pub fn with_item_from(&self, current: &Project, id: ItemId) -> Project {
+        let mut saved = self.clone();
+        saved.next_id = saved.next_id.max(current.next_id);
+        for id in current.item_and_its_rooms(id) {
+            let Some(entry) = current.find(id) else { continue };
+            if let Some(existing) = saved.find_mut(id) {
+                *existing = entry.clone();
+                continue;
+            }
+            let parent = current
+                .parent_of(id)
+                .flatten()
+                .filter(|parent| saved.find(*parent).is_some_and(ProjectEntry::is_folder));
+            saved.add(entry.clone(), parent);
+        }
+        saved
+    }
+
     /// Writes the project as the text of a `.ddm` file.
     pub fn to_file_text(&self) -> String {
         let file = ProjectFile {
@@ -1183,6 +1230,48 @@ mod tests {
             based_on: Some("N0000004.RDB".to_string()),
             objects: sample_objects(),
         })
+    }
+
+    #[test]
+    fn saving_one_item_keeps_other_changes_unsaved() {
+        let mut project = Project::default();
+        let folder = project.add_folder("Crypts", None);
+        let hall = room(&mut project, "Hall");
+        let hall_id = hall.id();
+        project.add(hall, Some(folder));
+        let other = room(&mut project, "Other");
+        let other_id = other.id();
+        project.add(other, None);
+        let dungeon_id = project.add_empty_dungeon("Hold");
+        let saved = project.clone();
+
+        // The dungeon gains a new room, the hall and the other room are edited.
+        let new_room = room(&mut project, "New");
+        let new_room_id = new_room.id();
+        project.add(new_room, Some(folder));
+        project.dungeon_mut(dungeon_id).unwrap().rooms.push(ProjectDungeonRoom {
+            block_name: "N0000004.RDB".to_string(),
+            grid_x: 0,
+            grid_z: 0,
+            is_starting_block: true,
+            room: Some(new_room_id),
+        });
+        project.room_mut(hall_id).unwrap().objects.clear();
+        project.room_mut(other_id).unwrap().objects.clear();
+        assert!(project.item_differs_from(&saved, dungeon_id));
+        assert!(project.item_differs_from(&saved, hall_id));
+        assert!(!project.same_contents(&saved));
+
+        // Saving the dungeon saves it and its new room (into its folder), nothing else.
+        let after = saved.with_item_from(&project, dungeon_id);
+        assert!(!project.item_differs_from(&after, dungeon_id));
+        assert_eq!(after.parent_of(new_room_id), Some(Some(folder)));
+        assert!(project.item_differs_from(&after, hall_id));
+        assert!(project.item_differs_from(&after, other_id));
+
+        // Saving the remaining rooms leaves nothing unsaved.
+        let after = after.with_item_from(&project, hall_id).with_item_from(&project, other_id);
+        assert!(project.same_contents(&after));
     }
 
     #[test]

@@ -164,8 +164,10 @@ pub struct DungeonMakerApp {
     project: Project,
     /// Where the project was last saved or opened from; `None` until it is saved.
     project_path: Option<PathBuf>,
-    /// The project as last saved or opened, to tell whether it has unsaved changes.
-    saved_project_text: String,
+    /// The project as last saved or opened, to tell what has unsaved changes.
+    /// Saving one cell or dungeon (Ctrl+S) saves it into this copy, which is
+    /// then written, so other unsaved changes stay unsaved.
+    saved_project: Project,
     workspace: Workspace,
     /// What the workspace shows; `None` when it is empty.
     opened_item: Option<OpenedItem>,
@@ -236,7 +238,7 @@ impl DungeonMakerApp {
         }
 
         let project = Project::default();
-        let saved_project_text = project.to_file_text();
+        let saved_project = project.clone();
         let mut app = Self {
             library: None,
             render_state,
@@ -246,7 +248,7 @@ impl DungeonMakerApp {
             custom_names,
             project,
             project_path: None,
-            saved_project_text,
+            saved_project,
             workspace: Workspace::Empty,
             opened_item: None,
             room_windows: Vec::new(),
@@ -1035,7 +1037,51 @@ impl DungeonMakerApp {
     /// Whether the project changed since it was last saved or opened.
     fn has_unsaved_changes(&mut self) -> bool {
         self.store_workspace_changes();
-        self.project.to_file_text() != self.saved_project_text
+        !self.project.same_contents(&self.saved_project)
+    }
+
+    /// The project room or dungeon open in the workspace, if one is.
+    fn opened_project_item(&self) -> Option<ItemId> {
+        match self.opened_item {
+            Some(OpenedItem::Project(id)) if self.project.find(id).is_some() => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Whether the project room or dungeon `id` (with, for a dungeon, its
+    /// cells) has changes that are not saved. Edits still in the workspace
+    /// count, as they are stored in the project every frame.
+    fn item_has_unsaved_changes(&self, id: ItemId) -> bool {
+        self.project.item_differs_from(&self.saved_project, id)
+    }
+
+    /// Saves the open cell or dungeon (Ctrl+S): only its changes, and for a
+    /// dungeon its cells', are written to the project file. Without an open
+    /// project item, or before the project has a file, the whole project is saved.
+    fn save_open_item(&mut self) {
+        self.store_workspace_changes();
+        let (Some(id), Some(path)) = (self.opened_project_item(), self.project_path.clone()) else {
+            self.save_project();
+            return;
+        };
+        let name = self.project.find(id).map(|entry| entry.name().to_string()).unwrap_or_default();
+        if !self.item_has_unsaved_changes(id) {
+            self.status_message = format!("{name} has no unsaved changes");
+            return;
+        }
+        let saved = self.saved_project.with_item_from(&self.project, id);
+        match saved.save(&path) {
+            Ok(()) => {
+                self.saved_project = saved;
+                let others = if self.has_unsaved_changes() {
+                    "; other changes in the project are still unsaved (File > Save project saves them)"
+                } else {
+                    ""
+                };
+                self.status_message = format!("Saved {name} to {}{others}", path.display());
+            }
+            Err(error) => self.error_message = Some(error),
+        }
     }
 
     /// Runs `action`, first asking what to do with unsaved changes if there are any.
@@ -1083,7 +1129,7 @@ impl DungeonMakerApp {
 
     /// Makes `project` the open project, saved at `path`.
     fn replace_project(&mut self, project: Project, path: Option<PathBuf>) {
-        self.saved_project_text = project.to_file_text();
+        self.saved_project = project.clone();
         self.project = project;
         self.project_path = path;
     }
@@ -1115,7 +1161,7 @@ impl DungeonMakerApp {
         self.store_workspace_changes();
         match self.project.save(path) {
             Ok(()) => {
-                self.saved_project_text = self.project.to_file_text();
+                self.saved_project = self.project.clone();
                 self.project_path = Some(path.to_path_buf());
                 self.status_message = format!("Saved project {}", path.display());
                 true
@@ -1142,7 +1188,7 @@ impl DungeonMakerApp {
             self.save_project_as();
         }
         if shortcut(Modifiers::COMMAND, Key::S) {
-            self.save_project();
+            self.save_open_item();
         }
         let has_library = self.library.is_some();
         if shortcut(Modifiers::COMMAND | Modifiers::SHIFT, Key::O) && self.can_open_dungeons() {
@@ -1212,11 +1258,37 @@ impl DungeonMakerApp {
             self.request(DiscardingAction::OpenProject);
             ui.close_menu();
         }
-        if ui.add(egui::Button::new("Save project").shortcut_text("Ctrl+S")).clicked() {
+        // The open cell or dungeon alone, then the whole project.
+        let item_kind = match self.opened_project_item().and_then(|id| self.project.find(id)) {
+            Some(ProjectEntry::Dungeon(_)) => Some("dungeon"),
+            Some(ProjectEntry::Room(_)) => Some("cell"),
+            _ => None,
+        };
+        let item_button = egui::Button::new(format!("Save {}", item_kind.unwrap_or("cell or dungeon")))
+            .shortcut_text("Ctrl+S");
+        let item_response = ui
+            .add_enabled(item_kind.is_some(), item_button)
+            .on_hover_text(
+                "Saves only the open cell or dungeon (a dungeon with its cells) to the project file",
+            )
+            .on_disabled_hover_text("Open one of your project's cells or dungeons to save it on its own");
+        if item_response.clicked() {
+            self.save_open_item();
+            ui.close_menu();
+        }
+        let project_response = ui.button("Save project").on_hover_text(
+            "Saves every change in the project: all cells and dungeons, folders and mod details",
+        );
+        if project_response.clicked() {
             self.save_project();
             ui.close_menu();
         }
-        if ui.add(egui::Button::new("Save project as…").shortcut_text("Ctrl+Shift+S")).clicked() {
+        let save_as = egui::Button::new("Save project as…").shortcut_text("Ctrl+Shift+S");
+        if ui
+            .add(save_as)
+            .on_hover_text("Saves the project with all its changes as a new project file, which stays open")
+            .clicked()
+        {
             self.save_project_as();
             ui.close_menu();
         }
@@ -1638,6 +1710,20 @@ impl DungeonMakerApp {
     /// Draws every room editor window and syncs their edits back into the dungeon view.
     fn show_room_windows(&mut self, context: &egui::Context) {
         let window_used_in = self.room_window_used_in();
+        // A room window's cell has unsaved changes if its project cell differs from the saved one.
+        let window_unsaved: Vec<bool> = self
+            .room_windows
+            .iter()
+            .map(|window| {
+                let Workspace::Dungeon(view) = &self.workspace else { return false };
+                window
+                    .dungeon_room_index
+                    .and_then(|index| view.room(index))
+                    .and_then(|room| room.project_room)
+                    .is_some_and(|room_id| self.item_has_unsaved_changes(room_id))
+            })
+            .collect();
+        let mut save_requested = false;
         let mut open_request = None;
         let mut context_requests = Vec::new();
         let mut cell_open_request = None;
@@ -1652,13 +1738,18 @@ impl DungeonMakerApp {
 
         let prompt = self.copy_prompt;
         let mut copy_choice = None;
-        for (window, used_in) in self.room_windows.iter_mut().zip(window_used_in) {
+        for ((window, used_in), unsaved) in
+            self.room_windows.iter_mut().zip(window_used_in).zip(window_unsaved)
+        {
             window.editor.set_used_in(used_in);
             // egui compares the builder with the previous frame's, so a renamed room updates the title.
             let builder = egui::ViewportBuilder::default()
-                .with_title(editor_window_title(&window.editor, resources.custom_names))
+                .with_title(editor_window_title(&window.editor, resources.custom_names, unsaved))
                 .with_inner_size(ROOM_WINDOW_SIZE);
             context.show_viewport_immediate(window.viewport_id, builder, |window_context, _class| {
+                // Ctrl+S saves the dungeon the window's cell belongs to, with its cells.
+                let save = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+                save_requested |= window_context.input_mut(|input| input.consume_shortcut(&save));
                 show_room_window_contents(window_context, window, &mut resources);
                 if let Some(prompt) = prompt.filter(|prompt| prompt.viewport == Some(window.viewport_id)) {
                     copy_choice = show_copy_prompt(window_context, prompt.subject).or(copy_choice);
@@ -1734,6 +1825,9 @@ impl DungeonMakerApp {
 
         if let Some(choice) = copy_choice {
             self.answer_copy_prompt(choice);
+        }
+        if save_requested {
+            self.save_open_item();
         }
         if let Some((dungeon, layout_index)) = cell_open_request {
             self.open_context_cell(context, dungeon, layout_index, true);
@@ -1877,12 +1971,21 @@ impl DungeonMakerApp {
 
     /// Updates the main window title to show what is open.
     fn update_window_title(&mut self, context: &egui::Context) {
+        // A * marks unsaved changes: the open cell's or dungeon's, and the project's.
+        self.store_workspace_changes();
+        let item_mark = match self.opened_project_item() {
+            Some(id) if self.item_has_unsaved_changes(id) => "*",
+            _ => "",
+        };
         let item = match &self.workspace {
-            Workspace::Room(editor) => Some(editor_title(editor, &self.custom_names)),
-            Workspace::Dungeon(view) => Some(view.description()),
+            Workspace::Room(editor) => {
+                Some(format!("{}{item_mark}", editor_title(editor, &self.custom_names)))
+            }
+            Workspace::Dungeon(view) => Some(format!("{}{item_mark}", view.description())),
             Workspace::Empty => None,
         };
-        let project = self.project_title();
+        let project_mark = if self.has_unsaved_changes() { "*" } else { "" };
+        let project = format!("{}{project_mark}", self.project_title());
         let title = match item {
             Some(item) => format!("{item} - {project} - {APPLICATION_NAME}"),
             None => format!("{project} - {APPLICATION_NAME}"),
@@ -1955,8 +2058,9 @@ fn editor_title(editor: &RoomEditor, custom_names: &CustomNames) -> String {
 }
 
 /// Window title of a room editor window.
-fn editor_window_title(editor: &RoomEditor, custom_names: &CustomNames) -> String {
-    format!("{} - {APPLICATION_NAME}", editor_title(editor, custom_names))
+fn editor_window_title(editor: &RoomEditor, custom_names: &CustomNames, unsaved: bool) -> String {
+    let mark = if unsaved { "*" } else { "" };
+    format!("{}{mark} - {APPLICATION_NAME}", editor_title(editor, custom_names))
 }
 
 /// Draws the "You cannot edit … from Daggerfall" question. Returns the user's answer once given.
