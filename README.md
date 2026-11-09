@@ -25,7 +25,7 @@ The program runs on Windows and Linux.
 ### Windows
 
 ```powershell
-./build.ps1
+./build.ps1
 ```
 
 This runs `cargo build --release` and produces
