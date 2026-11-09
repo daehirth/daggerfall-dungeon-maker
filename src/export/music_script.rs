@@ -40,6 +40,7 @@ pub fn music_script(mod_file_name: &str, dungeons: &[DungeonMusic]) -> String {
     let names = list(dungeons.iter().map(|dungeon| string_literal(&dungeon.location_name)).collect());
     let assets = list(dungeons.iter().map(|dungeon| string_literal(&dungeon.asset_name)).collect());
     let fade_seconds = FADE_SECONDS;
+    let current_dungeon = CURRENT_DUNGEON_METHOD;
     format!(
         r#"// Written by Daggerfall Dungeon Maker for the mod "{mod_file_name}".
 // Plays each of the mod's dungeons' own music inside it, instead of the game's.
@@ -148,23 +149,7 @@ public class {class_name} : MonoBehaviour
         source.volume = DaggerfallUnity.Settings.MusicVolume;
     }}
 
-    // The index of the dungeon the player is inside, or -1.
-    static int CurrentDungeon()
-    {{
-        GameManager game = GameManager.Instance;
-        if (game == null || game.PlayerEnterExit == null || game.PlayerGPS == null)
-            return -1;
-        if (!game.PlayerEnterExit.IsPlayerInsideDungeon || !game.PlayerGPS.HasCurrentLocation)
-            return -1;
-        var location = game.PlayerGPS.CurrentLocation;
-        for (int i = 0; i < Regions.Length; i++)
-        {{
-            if (Regions[i] == location.RegionIndex && LocationNames[i] == location.Name)
-                return i;
-        }}
-        return -1;
-    }}
-
+{current_dungeon}
     void Begin(int dungeon)
     {{
         playing = dungeon;
@@ -264,8 +249,29 @@ public class {class_name} : MonoBehaviour
     )
 }
 
+/// The C# method `CurrentDungeon()`, shared by the mod's scripts: the index
+/// in the script's `Regions` and `LocationNames` of the dungeon the player is
+/// inside, or -1.
+pub(super) const CURRENT_DUNGEON_METHOD: &str = r#"    // The index of the dungeon the player is inside, or -1.
+    static int CurrentDungeon()
+    {
+        GameManager game = GameManager.Instance;
+        if (game == null || game.PlayerEnterExit == null || game.PlayerGPS == null)
+            return -1;
+        if (!game.PlayerEnterExit.IsPlayerInsideDungeon || !game.PlayerGPS.HasCurrentLocation)
+            return -1;
+        var location = game.PlayerGPS.CurrentLocation;
+        for (int i = 0; i < Regions.Length; i++)
+        {
+            if (Regions[i] == location.RegionIndex && LocationNames[i] == location.Name)
+                return i;
+        }
+        return -1;
+    }
+"#;
+
 /// `name` as a C# identifier: letters, digits and underscores, not starting with a digit.
-fn identifier(name: &str) -> String {
+pub(super) fn identifier(name: &str) -> String {
     let mut identifier: String = name
         .chars()
         .map(|character| if character.is_ascii_alphanumeric() { character } else { '_' })
@@ -277,7 +283,7 @@ fn identifier(name: &str) -> String {
 }
 
 /// `text` as a C# string literal.
-fn string_literal(text: &str) -> String {
+pub(super) fn string_literal(text: &str) -> String {
     let mut literal = String::from("\"");
     for character in text.chars() {
         match character {

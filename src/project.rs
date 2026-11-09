@@ -96,10 +96,19 @@ pub struct DungeonLocation {
     pub custom_music: bool,
     /// The music file (`.ogg` or `.mp3`) the dungeon plays with [`Self::custom_music`].
     pub custom_music_file: String,
+    /// Whether a sky ([`Self::skybox_file`]) shows behind the dungeon instead of
+    /// black, seen through any openings. Only a `.dfmod` can do that (it
+    /// carries a script that shows it); with loose files the dungeon stays black.
+    pub skybox: bool,
+    /// The sky's image (`.png` or `.jpg`): a 360° panorama, twice as wide as it is high.
+    pub skybox_file: String,
 }
 
 /// Extensions of the music files a dungeon can play as custom music.
 pub const CUSTOM_MUSIC_EXTENSIONS: [&str; 2] = ["ogg", "mp3"];
+
+/// Extensions of the images a dungeon can use as its skybox.
+pub const SKYBOX_EXTENSIONS: [&str; 3] = ["png", "jpg", "jpeg"];
 
 impl Default for DungeonLocation {
     fn default() -> Self {
@@ -112,6 +121,8 @@ impl Default for DungeonLocation {
             music: None,
             custom_music: false,
             custom_music_file: String::new(),
+            skybox: false,
+            skybox_file: String::new(),
         }
     }
 }
@@ -156,6 +167,8 @@ impl DungeonLocation {
             music: None,
             custom_music: false,
             custom_music_file: String::new(),
+            skybox: false,
+            skybox_file: String::new(),
         }
     }
 
@@ -847,7 +860,7 @@ enum EntryFile {
         rooms: Vec<DungeonRoomFile>,
         /// Absent in files saved before dungeons had a location.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        location: Option<LocationFile>,
+        location: Option<Box<LocationFile>>,
     },
 }
 
@@ -869,6 +882,12 @@ struct LocationFile {
     /// The music file it plays; absent when none was chosen.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     custom_music_file: String,
+    /// Whether the dungeon shows a sky.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    skybox: bool,
+    /// The sky's image; absent when none was chosen.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    skybox_file: String,
     /// Location type name, for example "Large dungeon".
     location_type: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -900,6 +919,8 @@ impl LocationFile {
             music: location.music.map(|song| song.name.to_string()),
             custom_music: location.custom_music,
             custom_music_file: location.custom_music_file.clone(),
+            skybox: location.skybox,
+            skybox_file: location.skybox_file.clone(),
         }
     }
 
@@ -918,6 +939,8 @@ impl LocationFile {
             music: self.music.as_deref().and_then(DungeonSong::from_name),
             custom_music: self.custom_music,
             custom_music_file: self.custom_music_file,
+            skybox: self.skybox,
+            skybox_file: self.skybox_file,
         }
     }
 }
@@ -1042,7 +1065,7 @@ impl EntryFile {
                         room: room.room,
                     })
                     .collect(),
-                location: Some(LocationFile::from_location(&dungeon.location)),
+                location: Some(Box::new(LocationFile::from_location(&dungeon.location))),
             },
         }
     }
@@ -1092,7 +1115,7 @@ impl EntryFile {
                             room: room.room,
                         })
                         .collect(),
-                    location: location.map(LocationFile::into_location).unwrap_or_default(),
+                    location: location.map(|location| location.into_location()).unwrap_or_default(),
                 })
             }
         }
@@ -1322,6 +1345,8 @@ mod tests {
                     music: Some(crate::music::DUNGEON_SONGS[3]),
                     custom_music: true,
                     custom_music_file: "C:/Music/Hold.ogg".to_string(),
+                    skybox: true,
+                    skybox_file: "C:/Skies/Dusk.png".to_string(),
                 },
             }),
             None,
@@ -1338,6 +1363,8 @@ mod tests {
         assert_eq!(loaded_dungeon.location.music, Some(crate::music::DUNGEON_SONGS[3]));
         assert!(loaded_dungeon.location.custom_music);
         assert_eq!(loaded_dungeon.location.custom_music_file, "C:/Music/Hold.ogg");
+        assert!(loaded_dungeon.location.skybox);
+        assert_eq!(loaded_dungeon.location.skybox_file, "C:/Skies/Dusk.png");
         assert_eq!(
             loaded_dungeon.location.replaces.as_ref().map(DungeonReference::label).as_deref(),
             Some("Castle Necromoghan (Daggerfall)")

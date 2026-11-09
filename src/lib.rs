@@ -25,6 +25,7 @@ pub mod connectors;
 pub mod custom_names;
 pub mod encounters;
 pub mod export;
+pub mod merge;
 pub mod music;
 pub mod picking;
 pub mod project;

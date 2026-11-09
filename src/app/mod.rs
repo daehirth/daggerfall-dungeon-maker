@@ -1382,6 +1382,7 @@ impl DungeonMakerApp {
         let mut added_room = None;
         let mut deleted_room = None;
         let mut moved_room = None;
+        let mut merged_rooms: Option<Vec<usize>> = None;
         match &mut self.workspace {
             Workspace::Room(editor) => {
                 editor.set_used_in(std::mem::take(&mut main_used_in));
@@ -1451,9 +1452,15 @@ impl DungeonMakerApp {
                     properties_action = Some(action);
                 }
                 let project = &self.project;
+                // The skybox it shows in Daggerfall Unity, drawn behind it here too.
+                let skybox = (location.skybox && !location.skybox_file.trim().is_empty())
+                    .then(|| PathBuf::from(location.skybox_file.trim()));
                 egui::CentralPanel::default().frame(egui::Frame::none()).show(context, |ui| {
-                    room_to_open = view.show(ui, &mut resources, project);
+                    room_to_open = view.show(ui, &mut resources, project, skybox.as_deref());
                 });
+                if let Some(rooms) = view.take_merge_request() {
+                    merged_rooms = Some(rooms);
+                }
                 if let Some(room_index) = view.take_make_start_request() {
                     properties_action = Some(DungeonPropertiesAction::MakeStart(room_index));
                 }
@@ -1486,6 +1493,9 @@ impl DungeonMakerApp {
         }
         if let Some((room_index, from, to)) = moved_room {
             self.move_room_in_open_dungeon(room_index, from, to);
+        }
+        if let Some(rooms) = merged_rooms {
+            self.merge_rooms_in_open_dungeon(&rooms);
         }
         // Load the surrounding cells of a dungeon newly selected under "Used in".
         if let Some((dungeon, home)) = context_request {
@@ -1634,6 +1644,126 @@ impl DungeonMakerApp {
         placement.grid_x = spot.0;
         placement.grid_z = spot.1;
         self.status_message = format!("Moved {} to {}, {}", placement.block_name, spot.0, spot.1);
+    }
+
+    /// Merges the rooms `room_indices` of the open dungeon (chosen in the
+    /// dungeon view) into one new project cell, which takes their place in the
+    /// dungeon (see [`crate::merge`]). The cells merged are not changed;
+    /// project cells among them stay in the project. A Daggerfall dungeon
+    /// cannot be changed, so the user is asked to copy it first.
+    fn merge_rooms_in_open_dungeon(&mut self, room_indices: &[usize]) {
+        let Some(OpenedItem::Project(dungeon_id)) = self.opened_item else {
+            if self.copy_prompt.is_none() {
+                self.copy_prompt = Some(CopyPrompt { subject: CopySubject::Dungeon, viewport: None });
+            }
+            return;
+        };
+        // Edits to the dungeon's cells are kept before they are merged.
+        self.store_workspace_changes();
+        let Workspace::Dungeon(view) = &self.workspace else { return };
+        let mut picked = Vec::new();
+        for &room_index in room_indices {
+            let (Some(room), Some(layout_index)) = (view.room(room_index), view.layout_index(room_index))
+            else {
+                continue;
+            };
+            let spot = (
+                (room.origin.x / crate::arena2::RDB_BLOCK_SIDE).round() as i32,
+                (room.origin.z / crate::arena2::RDB_BLOCK_SIDE).round() as i32,
+            );
+            picked.push((layout_index, room.scene.objects.clone(), spot, room.is_starting_block));
+        }
+        let sources: Vec<crate::merge::MergeSource<'_>> = picked
+            .iter()
+            .map(|(_, objects, spot, is_start)| crate::merge::MergeSource {
+                objects,
+                spot: *spot,
+                is_start: *is_start,
+            })
+            .collect();
+        let merged = match crate::merge::merge_cells(&sources) {
+            Ok(merged) => merged,
+            Err(error) => {
+                self.status_message = format!("Could not merge the cells: {error}");
+                return;
+            }
+        };
+        let anchor_layout_index = picked[merged.anchor].0;
+        let mut removed: Vec<usize> = picked
+            .iter()
+            .map(|(layout_index, ..)| *layout_index)
+            .filter(|&index| index != anchor_layout_index)
+            .collect();
+        removed.sort_unstable();
+
+        // The new cell, named like the dungeon.
+        let dungeon_name =
+            self.project.dungeon(dungeon_id).map(|dungeon| dungeon.name.clone()).unwrap_or_default();
+        let base_name = format!("{dungeon_name} merged cell");
+        let name = std::iter::once(base_name.clone())
+            .chain((2..).map(|number| format!("{base_name} {number}")))
+            .find(|candidate| !self.project.has_item_named(candidate))
+            .expect("an unused name always exists");
+        let room_id = self.project.new_id();
+        let based_on = None;
+        self.project.add(
+            ProjectEntry::Room(ProjectRoom {
+                id: room_id,
+                name: name.clone(),
+                based_on,
+                objects: merged.objects,
+            }),
+            None,
+        );
+        let Some(dungeon) = self.project.dungeon_mut(dungeon_id) else { return };
+        if let Some(placement) = dungeon.rooms.get_mut(anchor_layout_index) {
+            placement.room = Some(room_id);
+            placement.grid_x = merged.spot.0;
+            placement.grid_z = merged.spot.1;
+            placement.is_starting_block = merged.is_start;
+        }
+        for &index in removed.iter().rev() {
+            if index < dungeon.rooms.len() {
+                dungeon.rooms.remove(index);
+            }
+        }
+
+        // The cells' windows close, and the view shows the dungeon again from the project.
+        self.close_room_windows();
+        self.reload_open_dungeon();
+        let mut message = format!("Merged {} cells into {name}", picked.len());
+        for warning in merged.warnings {
+            message.push_str(&format!("; {warning}"));
+        }
+        self.status_message = message;
+        self.show_current_names();
+    }
+
+    /// Loads the open project dungeon into the view again from the project,
+    /// keeping the camera and view options, after its layout changed.
+    fn reload_open_dungeon(&mut self) {
+        let Some(OpenedItem::Project(id)) = self.opened_item else { return };
+        let (Some(dungeon), Some(library)) = (self.project.dungeon(id), self.library.as_mut()) else {
+            return;
+        };
+        let (mut view, problems) = DungeonView::load(
+            &dungeon.name,
+            &dungeon.region_name,
+            dungeon.dungeon_type,
+            &dungeon.rooms,
+            &self.project,
+            library,
+        );
+        if let Workspace::Dungeon(old) = &mut self.workspace {
+            view.keep_view_of(old);
+            if let Some(render_state) = self.render_state.as_ref() {
+                old.release(render_state);
+            }
+        }
+        self.workspace = Workspace::Dungeon(Box::new(view));
+        if !problems.is_empty() {
+            self.error_message = Some(format!("Some cells could not be loaded:\n{}", problems.join("\n")));
+        }
     }
 
     /// Takes room `room_index` (pressed Delete on in the dungeon view) out of

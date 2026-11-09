@@ -603,6 +603,41 @@ fn exports_a_dungeon_replacing_one_of_daggerfalls() {
     );
     project.dungeon_mut(dungeon_id).unwrap().location.custom_music = false;
 
+    // With a skybox, the image goes into the mod with a script that shows it there.
+    let sky = std::env::temp_dir().join(format!("ddm-sky-{}.png", std::process::id()));
+    std::fs::write(&sky, b"\x89PNG").unwrap();
+    let location = &mut project.dungeon_mut(dungeon_id).unwrap().location;
+    location.skybox = true;
+    location.skybox_file = sky.display().to_string();
+    let with_sky = build_mod(&project, &mut library, &ModDetails::default(), "Replace", &[dungeon_id])
+        .expect("the mod builds");
+    assert_eq!(with_sky.copied_files.len(), 1);
+    assert_eq!(with_sky.copied_files[0].path, "Sky/replace_sky_0.png");
+    let script =
+        with_sky.files.iter().find(|file| file.path == "ReplaceDungeonSky.cs.txt").expect("the sky script");
+    assert!(script.contents.contains(r#"{ "Privateer's Hold" }"#));
+    assert!(script.contents.contains(r#"{ "replace_sky_0.mat" }"#));
+    assert!(script.contents.contains(r#"{ "replace_sky_0.png" }"#));
+    assert!(!with_sky.files.iter().any(|file| file.path.ends_with("DungeonMusic.cs.txt")));
+    // Written out, the image is in the mod's Sky folder.
+    let out = std::env::temp_dir().join(format!("ddm-sky-export-{}", std::process::id()));
+    let mod_folder =
+        daggerfall_dungeon_maker::export::write_mod(&with_sky, &out).expect("the mod is written");
+    assert!(mod_folder.join("Sky").join("replace_sky_0.png").is_file());
+    std::fs::remove_dir_all(&out).unwrap();
+    // An image that is not there stops the export.
+    std::fs::remove_file(&sky).unwrap();
+    let checks = check_project(&project, &mut library);
+    assert!(
+        checks[0]
+            .problems
+            .iter()
+            .any(|problem| problem.contains("skybox image") && problem.contains("was not found")),
+        "{:?}",
+        checks[0].problems
+    );
+    project.dungeon_mut(dungeon_id).unwrap().location.skybox = false;
+
     // Another dungeon cannot take the same place.
     let other_id = project.add_empty_dungeon("Second Hold");
     let replaced = project.dungeon(dungeon_id).unwrap().location.clone();

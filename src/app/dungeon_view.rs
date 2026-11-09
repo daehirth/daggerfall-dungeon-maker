@@ -5,6 +5,9 @@
 //! window. Edits made in those windows are copied back with
 //! [`DungeonView::update_room_objects`] so the dungeon always shows the latest version.
 //!
+//! Shift+click selects several cells (or Shift+drag a box over them); their
+//! right-click menu can merge them into one cell (see [`crate::merge`]).
+//!
 //! The properties panel on the right shows the dungeon's name, region, type,
 //! location and rooms. The name, type and location of a project dungeon can
 //! be changed there; its spot on the world map is chosen in a map window.
@@ -162,7 +165,25 @@ pub struct DungeonView {
     music_player: MusicPlayer,
     /// Openings of each model, by model id, for checking them.
     open_faces: std::collections::HashMap<u32, std::sync::Arc<[crate::connectors::OpenFace]>>,
+    /// Selected cells (Shift+click, or Shift+drag a box), which can be merged.
+    selected_rooms: Vec<usize>,
+    /// Where a selection box being dragged started.
+    selection_box_start: Option<egui::Pos2>,
+    /// The cells inside the selection box being dragged.
+    box_rooms: Vec<usize>,
+    /// Cells the user chose to merge, for the application to merge.
+    merge_request: Option<Vec<usize>>,
+    /// Whether the dungeon's skybox is drawn (View > Skybox).
+    show_skybox: bool,
+    /// Whether the dungeon has a skybox to draw.
+    has_skybox: bool,
 }
+
+/// Colours of the box dragged to select cells.
+const SELECTION_BOX_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(40, 70, 110, 40);
+const SELECTION_BOX_STROKE: egui::Color32 = egui::Color32::from_rgb(110, 170, 255);
+/// Smallest box, in points, that selects; anything smaller is a click.
+const SELECTION_BOX_MIN_SIZE: f32 = 4.0;
 
 /// A cell moved by dragging: its index, and the grid spots it came from and went to.
 pub type RoomMove = (usize, (i32, i32), (i32, i32));
@@ -265,6 +286,12 @@ impl DungeonView {
             unclosed_stale: true,
             unclosed_checked_at: f64::NEG_INFINITY,
             open_faces: std::collections::HashMap::new(),
+            selected_rooms: Vec::new(),
+            selection_box_start: None,
+            box_rooms: Vec::new(),
+            merge_request: None,
+            show_skybox: true,
+            has_skybox: false,
         };
         view.rebuild_combined_scene();
         view.frame_dungeon(library);
@@ -366,6 +393,74 @@ impl DungeonView {
         })
     }
 
+    /// Returns, once, the cells the user chose to merge.
+    pub fn take_merge_request(&mut self) -> Option<Vec<usize>> {
+        self.merge_request.take()
+    }
+
+    /// Keeps the camera and view options of `old`, a view of the same dungeon
+    /// this one replaces (for example after its cells were merged).
+    pub fn keep_view_of(&mut self, old: &DungeonView) {
+        self.camera = old.camera.clone();
+        self.view_settings = old.view_settings;
+        self.grid_height = old.grid_height;
+        self.show_skybox = old.show_skybox;
+    }
+
+    /// Selects the cells inside a selection box while it is dragged (with
+    /// Shift held when it started), adding them to the selection on release.
+    fn handle_selection_box(&mut self, response: &egui::Response, projection: &ViewportProjection) {
+        let (Some(start), Some(pointer)) = (self.selection_box_start, response.interact_pointer_pos()) else {
+            self.selection_box_start = None;
+            self.box_rooms.clear();
+            return;
+        };
+        let selection_box = egui::Rect::from_two_pos(start, pointer);
+        self.box_rooms = if selection_box.width().max(selection_box.height()) >= SELECTION_BOX_MIN_SIZE {
+            self.rooms
+                .iter()
+                .enumerate()
+                .filter(|(_, room)| {
+                    let center =
+                        room.origin + Vec3::new(RDB_BLOCK_SIDE * 0.5, self.grid_height, RDB_BLOCK_SIDE * 0.5);
+                    projection
+                        .world_to_screen(center)
+                        .is_some_and(|position| selection_box.contains(position))
+                })
+                .map(|(index, _)| index)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if response.drag_stopped() || !response.dragged() {
+            for room_index in std::mem::take(&mut self.box_rooms) {
+                if !self.selected_rooms.contains(&room_index) {
+                    self.selected_rooms.push(room_index);
+                }
+            }
+            self.selection_box_start = None;
+            self.last_pointer_position = None;
+        }
+    }
+
+    /// Selects only `room_index` (or nothing), or with `add` adds it to the
+    /// selection, or takes it out if it is selected.
+    fn click_room(&mut self, room_index: Option<usize>, add: bool) {
+        match (room_index, add) {
+            (Some(room_index), true) => {
+                match self.selected_rooms.iter().position(|&index| index == room_index) {
+                    Some(position) => {
+                        self.selected_rooms.remove(position);
+                    }
+                    None => self.selected_rooms.push(room_index),
+                }
+            }
+            (Some(room_index), false) => self.selected_rooms = vec![room_index],
+            (None, true) => {}
+            (None, false) => self.selected_rooms.clear(),
+        }
+    }
+
     /// Returns, once, the index of a cell the user pressed Delete on.
     pub fn take_delete_room_request(&mut self) -> Option<usize> {
         self.delete_room_request.take()
@@ -378,6 +473,7 @@ impl DungeonView {
             return;
         }
         let removed = self.rooms.remove(room_index);
+        self.selected_rooms.clear();
         for room in &mut self.rooms {
             if room.layout_index > removed.layout_index {
                 room.layout_index -= 1;
@@ -614,6 +710,13 @@ impl DungeonView {
             ui.close_menu();
         }
         ui.separator();
+        ui.add_enabled(self.has_skybox, egui::Checkbox::new(&mut self.show_skybox, "Skybox"))
+            .on_hover_text(
+                "Draws the dungeon's skybox behind it, as Daggerfall Unity shows it with the .dfmod",
+            )
+            .on_disabled_hover_text(
+                "The dungeon has no skybox: tick Skybox in its properties and choose an image",
+            );
         super::room_editor::view_settings_menu(ui, &mut self.view_settings);
     }
 
@@ -624,6 +727,13 @@ impl DungeonView {
             && context.input_mut(|input| input.consume_shortcut(&frame_shortcut))
         {
             self.frame_dungeon(library);
+        }
+        let escape = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Escape);
+        if !context.wants_keyboard_input()
+            && !self.selected_rooms.is_empty()
+            && context.input_mut(|input| input.consume_shortcut(&escape))
+        {
+            self.selected_rooms.clear();
         }
     }
 
@@ -673,6 +783,8 @@ impl DungeonView {
                 ui.label(egui::RichText::new("Hover to highlight, double-click to edit").weak());
                 let mut hovered_row = None;
                 let mut deleted_row = None;
+                let mut clicked_row = None;
+                let shift = ui.input(|input| input.modifiers.shift);
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     for (room_index, room) in self.rooms.iter().enumerate() {
                         let room_name =
@@ -682,7 +794,8 @@ impl DungeonView {
                             };
                         let response = ui
                             .horizontal(|ui| {
-                                let highlighted = self.hovered_room == Some(room_index);
+                                let highlighted = self.hovered_room == Some(room_index)
+                                    || self.selected_rooms.contains(&room_index);
                                 let response = ui.selectable_label(highlighted, room_name);
                                 let source = if room.project_room.is_some() { "copy" } else { "Daggerfall" };
                                 ui.label(egui::RichText::new(source).weak().small());
@@ -696,7 +809,8 @@ impl DungeonView {
                             })
                             .inner
                             .on_hover_text(format!(
-                                "{} ({})\nDouble-click to open it in a cell editor, right-click for more",
+                                "{} ({})\nDouble-click to open it in a cell editor, Shift+click to select several, \
+                                 right-click for more",
                                 room.block_name,
                                 category_description(&room.block_name)
                             ));
@@ -705,8 +819,15 @@ impl DungeonView {
                         }
                         if response.double_clicked() {
                             action = Some(DungeonPropertiesAction::OpenRoom(room_index));
+                        } else if response.clicked() && shift {
+                            clicked_row = Some(room_index);
                         }
+                        let merge_count = self.selected_rooms.len();
+                        let in_selection = self.selected_rooms.contains(&room_index);
                         response.context_menu(|ui| {
+                            if in_selection && merge_button(ui, merge_count) {
+                                self.merge_request = Some(self.selected_rooms.clone());
+                            }
                             if make_start_button(ui, room) {
                                 action = Some(DungeonPropertiesAction::MakeStart(room_index));
                             }
@@ -717,6 +838,9 @@ impl DungeonView {
                     }
                 });
                 self.list_hovered_room = hovered_row;
+                if clicked_row.is_some() {
+                    self.click_room(clicked_row, true);
+                }
                 if deleted_row.is_some() {
                     self.delete_room_request = deleted_row;
                 }
@@ -944,12 +1068,14 @@ impl DungeonView {
 
             if !details.read_only {
                 show_custom_music_rows(ui, &mut edited);
+                show_skybox_rows(ui, &mut edited);
             }
         });
 
         if !details.read_only {
             let mut problems = location.problems(details.world, details.other_dungeons);
             problems.extend(crate::export::custom_music_problem(location));
+            problems.extend(crate::export::skybox_problem(location));
             if !self.has_usable_exit() {
                 problems.push(
                     "It has no exit: its start cell needs an exit door (model 70300) for the player to leave by"
@@ -1105,12 +1231,17 @@ impl DungeonView {
     /// A cell dragged in from the project panel is shown, faded, on the grid
     /// spot under the pointer; dropping it there asks for it to be added (see
     /// [`Self::take_add_room_request`]).
+    ///
+    /// `skybox` is the dungeon's skybox image, drawn behind it unless View >
+    /// Skybox is off.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         resources: &mut EditorResources<'_>,
         project: &Project,
+        skybox: Option<&std::path::Path>,
     ) -> Option<usize> {
+        self.has_skybox = skybox.is_some();
         let rect = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
         // When the camera moves, what is under a still pointer changes too.
@@ -1118,7 +1249,19 @@ impl DungeonView {
             self.last_pointer_position = None;
         }
         let projection = ViewportProjection::new(&self.camera, rect);
-        self.handle_room_drag(&response, &projection);
+        // Shift+drag draws a box selecting cells; a drag without Shift moves the cell under the pointer.
+        let shift = ui.input(|input| input.modifiers.shift);
+        if response.drag_started_by(egui::PointerButton::Primary) && shift {
+            self.selection_box_start = response.interact_pointer_pos();
+        }
+        if self.selection_box_start.is_some() {
+            self.handle_selection_box(&response, &projection);
+        } else {
+            self.handle_room_drag(&response, &projection);
+        }
+        if response.clicked_by(egui::PointerButton::Primary) {
+            self.click_room(self.hovered_room, shift);
+        }
         self.update_drop_preview(ui, &response, &projection, project, resources.library);
         let drop_spot = self.drop_spot();
         let mut room_outlines = self.room_outlines.clone();
@@ -1138,8 +1281,11 @@ impl DungeonView {
         let dragged_room = self.room_drag.as_ref().map(|drag| drag.room_index);
         let highlighted_room = dragged_room.or(self.list_hovered_room).or(self.hovered_room);
         for (room_index, outline) in self.room_outlines.iter_mut().enumerate() {
-            outline.highlighted = highlighted_room == Some(room_index);
+            outline.highlighted = highlighted_room == Some(room_index)
+                || self.selected_rooms.contains(&room_index)
+                || self.box_rooms.contains(&room_index);
         }
+        let sky = skybox.filter(|_| self.show_skybox);
         let request = FrameRequest {
             scene: Some(&self.combined_scene),
             camera: &self.camera,
@@ -1148,6 +1294,8 @@ impl DungeonView {
             selected_objects: &[],
             hovered_objects: &[],
             highlighted_group: highlighted_room,
+            highlighted_groups: &self.box_rooms,
+            selected_groups: &self.selected_rooms,
             placement_preview: None,
             context_scene: drop_spot.and(self.drop_preview.as_ref()).map(|preview| &preview.placed),
             ground_squares: &[],
@@ -1157,8 +1305,31 @@ impl DungeonView {
             grid_height: self.grid_height,
             snap_grid_spacing: None,
             size_in_pixels: size_in_pixels(ui, rect),
+            sky,
         };
         paint_scene(ui, rect, resources, &mut self.target, &request);
+        if let Some(start) = self.selection_box_start {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let painter = ui.painter_at(rect);
+                let selection_box = egui::Rect::from_two_pos(start, pointer);
+                painter.rect_filled(selection_box, 0.0, SELECTION_BOX_FILL);
+                painter.rect_stroke(selection_box, 0.0, egui::Stroke::new(1.0_f32, SELECTION_BOX_STROKE));
+            }
+        }
+        // A skybox image that cannot be read is said so in the view.
+        let sky_error = sky.and_then(|path| {
+            let error = resources.renderer.as_deref()?.sky_error(path)?;
+            Some(format!("Skybox {}: {error}", path.display()))
+        });
+        if let Some(error) = sky_error {
+            ui.painter_at(rect).text(
+                rect.left_top() + egui::vec2(10.0, 10.0),
+                egui::Align2::LEFT_TOP,
+                error,
+                egui::FontId::proportional(13.0),
+                WARNING_COLOR,
+            );
+        }
         self.update_unclosed_openings(ui, resources);
         if let Some(unclosed) = &self.unclosed {
             draw_unclosed_openings(&ui.painter_at(rect), &projection, unclosed);
@@ -1195,15 +1366,27 @@ impl DungeonView {
             }
         }
 
-        // Right-click (without dragging, which orbits) names the room under the pointer.
+        // Right-click (without dragging, which orbits) names the room under the pointer;
+        // with several cells selected, it can merge them.
         if response.secondary_clicked() {
             self.renamed_room = self.hovered_room;
         }
+        let merge_count = self.selected_rooms.len();
+        let can_merge = merge_count >= 2
+            && self.renamed_room.is_none_or(|room_index| self.selected_rooms.contains(&room_index));
         response.context_menu(|ui| {
+            if can_merge && merge_button(ui, merge_count) {
+                self.merge_request = Some(self.selected_rooms.clone());
+            }
             let Some(room) = self.renamed_room.and_then(|index| self.rooms.get(index)) else {
-                ui.close_menu();
+                if !can_merge {
+                    ui.close_menu();
+                }
                 return;
             };
+            if can_merge {
+                ui.separator();
+            }
             ui.strong(&room.block_name);
             show_room_name_field(ui, &room.block_name, resources.custom_names);
             ui.separator();
@@ -1276,7 +1459,8 @@ impl DungeonView {
             self.hovered_room.filter(|_| self.room_drag.is_none()).and_then(|index| self.rooms.get(index));
         if let (Some(room), Some(pointer)) = (hovered, response.hover_pos()) {
             let label = format!(
-                "{} ({})\nDouble-click to edit this cell · drag to move it · Delete to remove it",
+                "{} ({})\nDouble-click to edit this cell · drag to move it · Delete to remove it\n\
+                 Shift+click or Shift+drag a box to select several, then right-click to merge them",
                 custom_names.room_label(&room.block_name),
                 category_description(&room.block_name)
             );
@@ -1486,6 +1670,64 @@ fn show_custom_music_rows(ui: &mut egui::Ui, edited: &mut DungeonLocation) {
         }
     });
     ui.end_row();
+}
+
+/// Draws the "Skybox" rows: a tick box for showing a sky behind the dungeon
+/// and, while it is ticked, the image with **Browse…** to choose it.
+fn show_skybox_rows(ui: &mut egui::Ui, edited: &mut DungeonLocation) {
+    ui.label("Skybox").on_hover_text(
+        "Shows a sky of your own behind the dungeon instead of black, seen through any openings to the \
+         outside (a broken ceiling, a chasm, an open courtyard). Only a .dfmod can do this: it carries a \
+         script that shows the sky there. With the exported files used loose, the dungeon stays black.",
+    );
+    ui.checkbox(&mut edited.skybox, "Show a sky");
+    ui.end_row();
+    if !edited.skybox {
+        return;
+    }
+    ui.label("Sky image").on_hover_text(
+        "A PNG or JPG panorama of the whole sky (360 degrees around, from straight up to straight down), \
+         twice as wide as it is high, for example 4096 × 2048. It is copied into the mod.",
+    );
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut edited.skybox_file)
+                .hint_text("Choose a PNG or JPG image")
+                .desired_width(170.0),
+        );
+        if ui.button("Browse…").clicked() {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("Sky image for the dungeon")
+                .add_filter("Images (PNG, JPG)", &crate::project::SKYBOX_EXTENSIONS);
+            if let Some(folder) =
+                std::path::Path::new(edited.skybox_file.trim()).parent().filter(|folder| folder.is_dir())
+            {
+                dialog = dialog.set_directory(folder);
+            }
+            if let Some(file) = dialog.pick_file() {
+                edited.skybox_file = file.display().to_string();
+            }
+        }
+    });
+    ui.end_row();
+}
+
+/// Draws the "Merge" entry of a cell menu, for the `count` selected cells.
+/// Returns whether it was clicked (the menu then closes).
+fn merge_button(ui: &mut egui::Ui, count: usize) -> bool {
+    let response = ui
+        .add_enabled(count >= 2, egui::Button::new(format!("Merge {count} selected cells")))
+        .on_hover_text(
+            "Makes one new cell of your own from the selected cells, with all their objects where they are \
+             now, and puts it in the dungeon in their place. The cells themselves are not changed: your own \
+             cells stay in the project.",
+        )
+        .on_disabled_hover_text("Shift+click, or Shift+drag a box over, at least two cells to merge them");
+    let clicked = response.clicked();
+    if clicked {
+        ui.close_menu();
+    }
+    clicked
 }
 
 /// World position of the minimum corner of grid spot (`grid_x`, `grid_z`).

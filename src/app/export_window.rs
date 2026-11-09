@@ -378,6 +378,14 @@ impl ExportWindow {
             .filter(|check| check.custom_music && selected.contains(&check.id))
             .map(|check| check.name.clone())
             .collect();
+        // And those with a skybox, which loose files cannot show either.
+        let skyboxes: Vec<String> = self
+            .checks
+            .iter()
+            .flatten()
+            .filter(|check| check.skybox && selected.contains(&check.id))
+            .map(|check| check.name.clone())
+            .collect();
         let settings = &mut self.settings;
         ui.horizontal(|ui| {
             ui.label("Folder");
@@ -408,8 +416,19 @@ impl ExportWindow {
             if !custom_music.is_empty() {
                 ui.label(
                     egui::RichText::new(format!(
-                        "⚠ Custom music is not supported in loose files: {} will fall back to the game's own music                          (the song chosen under Music). Build a .dfmod with Unity to play it.",
+                        "⚠ Custom music is not supported in loose files: {} will fall back to the game's own music \
+                         (the song chosen under Music). Build a .dfmod with Unity to play it.",
                         custom_music.join(", ")
+                    ))
+                    .color(ui.visuals().warn_fg_color),
+                );
+            }
+            if !skyboxes.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "⚠ Skyboxes do not work in loose files: {} will show black behind the dungeon, as \
+                         Daggerfall's dungeons do. Build a .dfmod with Unity to show the skybox.",
+                        skyboxes.join(", ")
                     ))
                     .color(ui.visuals().warn_fg_color),
                 );

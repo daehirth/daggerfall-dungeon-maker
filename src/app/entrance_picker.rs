@@ -412,6 +412,8 @@ impl EntrancePicker {
                 selected_objects: &preview.entrance_doors,
                 hovered_objects: &[],
                 highlighted_group: None,
+                highlighted_groups: &[],
+                selected_groups: &[],
                 placement_preview: None,
                 context_scene: None,
                 ground_squares: &preview.ground,
@@ -421,6 +423,7 @@ impl EntrancePicker {
                 grid_height: 0.0,
                 snap_grid_spacing: None,
                 size_in_pixels: size_in_pixels(ui, rect),
+                sky: None,
             };
             paint_scene(ui, rect, resources, &mut self.target, &request);
         });

@@ -26,6 +26,7 @@
 
 pub mod json;
 pub mod music_script;
+pub mod sky_script;
 pub mod unity;
 
 use std::collections::{HashMap, HashSet};
@@ -89,6 +90,8 @@ pub struct ExportedDungeon {
     pub replaces: Option<String>,
     /// The music file it plays, if it has its own music.
     pub custom_music: Option<String>,
+    /// The image of its sky, if it has one.
+    pub skybox: Option<String>,
 }
 
 /// A file copied into the mod as it is, such as a dungeon's music.
@@ -102,6 +105,10 @@ pub struct CopiedFile {
 
 /// Folder inside the mod that holds the dungeons' music files.
 pub const MUSIC_FOLDER: &str = "Music";
+
+/// Folder inside the mod that holds the dungeons' skybox images. Building the
+/// `.dfmod` with Unity makes a skybox material next to each one.
+pub const SKY_FOLDER: &str = "Sky";
 
 /// A project cell an export adds to the game, and the block name it gets.
 #[derive(Debug, Clone)]
@@ -144,6 +151,8 @@ pub struct DungeonCheck {
     pub replaces: Option<String>,
     /// Whether it plays its own music file, which only a `.dfmod` can do.
     pub custom_music: bool,
+    /// Whether it shows a skybox, which only a `.dfmod` can do.
+    pub skybox: bool,
 }
 
 impl DungeonCheck {
@@ -189,6 +198,7 @@ pub fn check_project(project: &Project, library: &mut Arena2Library) -> Vec<Dung
                 problems,
                 replaces: dungeon.location.replaces.as_ref().map(|replaced| replaced.label()),
                 custom_music: dungeon.location.custom_music,
+                skybox: dungeon.location.skybox,
             }
         })
         .collect()
@@ -214,6 +224,26 @@ pub fn custom_music_problem(location: &crate::project::DungeonLocation) -> Optio
     None
 }
 
+/// What is wrong with the skybox of `location`, if it has a skybox.
+pub fn skybox_problem(location: &crate::project::DungeonLocation) -> Option<String> {
+    if !location.skybox {
+        return None;
+    }
+    let file = location.skybox_file.trim();
+    if file.is_empty() {
+        return Some("Skybox is ticked but no image is chosen".to_string());
+    }
+    let path = Path::new(file);
+    let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or("").to_lowercase();
+    if !crate::project::SKYBOX_EXTENSIONS.contains(&extension.as_str()) {
+        return Some(format!("Its skybox, {file}, is not a PNG or JPG image"));
+    }
+    if !path.is_file() {
+        return Some(format!("Its skybox image, {file}, was not found"));
+    }
+    None
+}
+
 /// What, besides its location, stops `dungeon` being exported.
 fn dungeon_problems(
     project: &Project,
@@ -227,6 +257,9 @@ fn dungeon_problems(
         problems.push("MAPS.BSA was not found, so the world map cannot be read".to_string());
     }
     if let Some(problem) = custom_music_problem(&dungeon.location) {
+        problems.push(problem);
+    }
+    if let Some(problem) = skybox_problem(&dungeon.location) {
         problems.push(problem);
     }
     if dungeon.dungeon_type.is_none() {
@@ -426,6 +459,7 @@ pub fn build_mod(
     let mut taken_location_files = HashSet::new();
     let mut copied_files = Vec::new();
     let mut music_entries = Vec::new();
+    let mut sky_entries = Vec::new();
     for dungeon in &ready {
         let pixel = dungeon.location.map_pixel.ok_or("a dungeon lost its place")?;
         let replaced = match &dungeon.location.replaces {
@@ -534,18 +568,42 @@ pub fn build_mod(
                 asset_name,
             });
         }
+        // Its sky: the image goes into the mod, and the script shows it here.
+        let skybox = dungeon.location.skybox.then(|| PathBuf::from(dungeon.location.skybox_file.trim()));
+        if let Some(source) = &skybox {
+            let extension =
+                source.extension().and_then(|extension| extension.to_str()).unwrap_or("png").to_lowercase();
+            let stem = format!("{}_sky_{}", file_name.to_lowercase(), sky_entries.len());
+            copied_files.push(CopiedFile {
+                path: format!("{SKY_FOLDER}/{stem}.{extension}"),
+                source: source.clone(),
+            });
+            sky_entries.push(sky_script::DungeonSky {
+                region_index,
+                location_name: name.to_string(),
+                material_name: format!("{stem}.mat"),
+                image_name: format!("{stem}.{extension}"),
+            });
+        }
         exported.push(ExportedDungeon {
             name: dungeon.name.clone(),
             region_index,
             map_pixel: pixel,
             replaces: replaced.map(|definition| definition.name.clone()),
             custom_music: custom_music.map(|source| source.display().to_string()),
+            skybox: skybox.map(|source| source.display().to_string()),
         });
     }
     if !music_entries.is_empty() {
         files.push(ExportedFile {
             path: format!("{file_name}DungeonMusic.cs.txt"),
             contents: music_script::music_script(&file_name, &music_entries),
+        });
+    }
+    if !sky_entries.is_empty() {
+        files.push(ExportedFile {
+            path: format!("{file_name}DungeonSky.cs.txt"),
+            contents: sky_script::sky_script(&file_name, &sky_entries),
         });
     }
 
@@ -585,8 +643,8 @@ pub fn build_mod(
 /// replacing what an earlier export left there. Returns the mod's folder.
 pub fn write_mod(mod_files: &ModFiles, folder: &Path) -> Result<PathBuf, String> {
     let mod_folder = folder.join(&mod_files.file_name);
-    // Files of dungeons, cells and music since removed must not linger.
-    for folder in [WORLD_DATA_FOLDER, MUSIC_FOLDER] {
+    // Files of dungeons, cells, music and skies since removed must not linger.
+    for folder in [WORLD_DATA_FOLDER, MUSIC_FOLDER, SKY_FOLDER] {
         let folder = mod_folder.join(folder);
         if folder.is_dir() {
             std::fs::remove_dir_all(&folder)
@@ -645,6 +703,9 @@ fn readme_text(mod_files: &ModFiles) -> String {
         }
         if let Some(music) = &dungeon.custom_music {
             text.push_str(&format!(", playing its own music ({music}; only in the .dfmod)"));
+        }
+        if let Some(sky) = &dungeon.skybox {
+            text.push_str(&format!(", with a skybox ({sky}; only in the .dfmod)"));
         }
         text.push('\n');
     }

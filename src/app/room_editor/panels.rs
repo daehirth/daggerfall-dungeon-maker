@@ -142,15 +142,20 @@ impl RoomEditor {
         }
     }
 
-    /// With several objects selected: lists them, and explains they can only be moved.
+    /// With several objects selected: lists them, and explains what can be done with them.
     fn show_multiple_selection(&mut self, ui: &mut egui::Ui, resources: &EditorResources<'_>) {
         let selected = self.selected_indices();
         ui.strong(format!("{} objects selected", selected.len())).on_hover_text(
-            "Shift+click objects, or drag a box around them, to select several. Several objects can \
-             only be moved: drag the arrows to move them together.",
+            "Shift+click objects, or drag a box around them, to select several. Several objects can be \
+             moved together (drag the arrows), copied (Ctrl+C) and pasted (Ctrl+V) into this cell or another, \
+             duplicated (Ctrl+D) or deleted (Del).",
         );
         ui.label(
-            egui::RichText::new("Drag the arrows to move them together. Click one object to edit it.").weak(),
+            egui::RichText::new(
+                "Drag the arrows to move them together; Ctrl+C, Ctrl+V, Ctrl+D or Del to copy, paste, \
+                 duplicate or delete them. Click one object to edit it.",
+            )
+            .weak(),
         );
         ui.add_space(6.0);
         let mut select_only = None;

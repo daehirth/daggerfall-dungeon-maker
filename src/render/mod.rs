@@ -5,6 +5,8 @@
 //! 2. camera-facing billboards for flats and markers, batched per texture,
 //! 3. helper lines: the floor grid, room outlines, lights and the selection box.
 //!
+//! A dungeon's skybox, if it has one, is drawn first, behind everything (see [`sky`]).
+//!
 //! One [`SceneRenderer`] is shared by every window. GPU copies of models and
 //! textures are created lazily from the [`Arena2Library`] the first time they
 //! are drawn and kept until the renderer is dropped. Each viewport owns a
@@ -12,6 +14,7 @@
 
 mod gpu_types;
 mod resources;
+mod sky;
 mod thumbnails;
 
 use std::collections::{BTreeMap, HashMap};
@@ -32,11 +35,11 @@ use thumbnails::ThumbnailCache;
 pub use thumbnails::ThumbnailStatus;
 
 /// Colour format of the offscreen viewport image.
-const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+pub(crate) const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// Depth buffer format.
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Multisample count used for anti-aliasing.
-const SAMPLE_COUNT: u32 = 4;
+pub(crate) const SAMPLE_COUNT: u32 = 4;
 /// Background colour of the viewport.
 const BACKGROUND_COLOR: wgpu::Color = wgpu::Color { r: 0.035, g: 0.04, b: 0.05, a: 1.0 };
 
@@ -106,8 +109,16 @@ pub struct RoomOutline {
 
 impl FrameRequest<'_> {
     /// Whether object `index` is drawn as selected.
-    fn is_selected(&self, index: usize) -> bool {
-        self.selected_object == Some(index) || self.selected_objects.contains(&index)
+    fn is_selected(&self, index: usize, object: &SceneObject) -> bool {
+        self.selected_object == Some(index)
+            || self.selected_objects.contains(&index)
+            || self.selected_groups.contains(&object.group_index)
+    }
+
+    /// Whether every object of `object`'s group is highlighted, as a hovered room is.
+    fn is_group_highlighted(&self, object: &SceneObject) -> bool {
+        self.highlighted_group == Some(object.group_index)
+            || self.highlighted_groups.contains(&object.group_index)
     }
 }
 
@@ -123,6 +134,10 @@ pub struct FrameRequest<'frame> {
     pub hovered_objects: &'frame [usize],
     /// Every object whose group index matches is highlighted (used for whole rooms in the dungeon view).
     pub highlighted_group: Option<usize>,
+    /// More groups highlighted the same way, such as the rooms inside a selection box.
+    pub highlighted_groups: &'frame [usize],
+    /// Groups whose every object is drawn as selected (selected rooms in the dungeon view).
+    pub selected_groups: &'frame [usize],
     /// Object being placed from the asset palette, drawn as a ghost.
     pub placement_preview: Option<&'frame SceneObject>,
     /// Water surfaces to draw, each the corner of a cell's square at its water height.
@@ -141,6 +156,8 @@ pub struct FrameRequest<'frame> {
     pub snap_grid_spacing: Option<f32>,
     /// Viewport size in physical pixels.
     pub size_in_pixels: [u32; 2],
+    /// A skybox image (a 360° panorama) drawn behind everything, if any.
+    pub sky: Option<&'frame std::path::Path>,
 }
 
 /// The image one viewport is rendered into, plus the egui texture that displays it.
@@ -290,6 +307,8 @@ pub struct SceneRenderer {
     water_vertex_buffer: GrowableBuffer,
     /// Rendered previews of models for the asset palette.
     thumbnails: ThumbnailCache,
+    /// Draws skyboxes behind dungeons.
+    sky: sky::SkyRenderer,
 }
 
 impl SceneRenderer {
@@ -411,6 +430,7 @@ impl SceneRenderer {
         ));
 
         let thumbnails = ThumbnailCache::new(device);
+        let sky = sky::SkyRenderer::new(device);
 
         Self {
             camera_buffer,
@@ -436,7 +456,13 @@ impl SceneRenderer {
             line_vertex_buffer: GrowableBuffer::new(device, "line vertices", wgpu::BufferUsages::VERTEX),
             water_vertex_buffer: GrowableBuffer::new(device, "water vertices", wgpu::BufferUsages::VERTEX),
             thumbnails,
+            sky,
         }
+    }
+
+    /// Why the skybox image at `path` could not be drawn, if it could not.
+    pub fn sky_error(&self, path: &std::path::Path) -> Option<&str> {
+        self.sky.error(path)
     }
 
     /// Drops every cached model, texture and thumbnail, for example after a different ARENA2 folder is loaded.
@@ -468,6 +494,8 @@ impl SceneRenderer {
         let camera_uniform =
             CameraUniform::new(camera.view_projection(aspect_ratio), camera.eye_position(), billboard_right);
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
+        let view_projection = camera.view_projection(aspect_ratio);
+        let sky = request.sky.filter(|path| self.sky.prepare(device, queue, path, view_projection));
 
         let (model_batches, billboard_batches) =
             self.prepare_scene_instances(device, queue, library, request);
@@ -503,6 +531,10 @@ impl SceneRenderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            // The sky, behind everything.
+            if let Some(path) = sky {
+                self.sky.draw(&mut pass, path);
+            }
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
             // Models.
@@ -570,9 +602,9 @@ impl SceneRenderer {
     ) -> (Vec<ModelBatch>, Vec<BillboardBatch>) {
         let settings = request.settings;
         let highlight_for = |index: usize, object: &SceneObject| {
-            if request.is_selected(index) {
+            if request.is_selected(index, object) {
                 SELECTION_HIGHLIGHT
-            } else if request.highlighted_group == Some(object.group_index) {
+            } else if request.is_group_highlighted(object) {
                 ROOM_HIGHLIGHT
             } else if request.hovered_objects.contains(&index) {
                 BOX_SELECTION_HIGHLIGHT
@@ -753,7 +785,7 @@ fn build_helper_lines(library: &mut Arena2Library, request: &FrameRequest<'_>) -
             if !object.visible {
                 continue;
             }
-            let selected = request.is_selected(index);
+            let selected = request.is_selected(index, object);
             let color = if selected { Vec4::new(1.0, 0.6, 0.1, 1.0) } else { Vec4::new(1.0, 0.9, 0.35, 1.0) };
             let center = object.position;
             let size = LIGHT_PICK_RADIUS;

@@ -1,6 +1,6 @@
 [package]
 name = "daggerfall-dungeon-maker"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A CAD-style 3D viewer and editor for The Elder Scrolls II: Daggerfall dungeons and dungeon blocks."
 license = "MIT"
@@ -29,6 +29,8 @@ bytemuck = { version = "1.16", features = ["derive"] }
 glam = "0.29"
 # Native file and folder dialogs.
 rfd = "0.15"
+# Reading the PNG and JPG images used as dungeon skyboxes.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Logging facade and a simple console logger for debug builds.
 log = "0.4"
 env_logger = "0.11"
@@ -46,3 +48,7 @@ lto = "thin"
 # Keep parsing fast while iterating in debug builds; the data files are large.
 [profile.dev.package."*"]
 opt-level = 2
+
+# Checking the WGSL shaders in tests, as wgpu checks them when the program starts.
+[dev-dependencies]
+naga = { version = "22.1", features = ["wgsl-in"] }

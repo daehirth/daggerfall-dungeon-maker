@@ -28,11 +28,13 @@ const BUILD_OUTPUT_FOLDER: &str = "DungeonMakerBuild";
 /// The editor script. Run with `-executeMethod DungeonMakerModBuilder.Build`.
 const BUILDER_SCRIPT: &str = r#"// Written by Daggerfall Dungeon Maker, which replaces it before each build.
 // Builds a Daggerfall Unity mod (.dfmod) from every file in a folder, as
-// Daggerfall Unity's Mod Builder does.
+// Daggerfall Unity's Mod Builder does. Images in its Sky folder first get a
+// skybox material each, which the mod's sky script shows in game.
 using System;
 using System.IO;
 using System.Linq;
 using UnityEditor;
+using UnityEngine;
 
 public static class DungeonMakerModBuilder
 {
@@ -44,6 +46,7 @@ public static class DungeonMakerModBuilder
         string[] targets = Argument("-ddmTargets").Split(',');
 
         AssetDatabase.Refresh(ImportAssetOptions.ForceUpdate);
+        MakeSkyboxes(assetFolder + "/Sky");
         string[] assets = Directory.GetFiles(assetFolder, "*", SearchOption.AllDirectories)
             .Where(path => !path.EndsWith(".meta", StringComparison.Ordinal))
             .Select(path => path.Replace('\\', '/'))
@@ -62,6 +65,49 @@ public static class DungeonMakerModBuilder
             if (manifest == null)
                 throw new Exception("Unity could not build the mod for " + target);
         }
+    }
+
+    // A panoramic skybox material next to each image in `folder`, with the
+    // image's name: the image is a 360-degree panorama (twice as wide as high).
+    static void MakeSkyboxes(string folder)
+    {
+        if (!Directory.Exists(folder))
+            return;
+        string[] images = Directory.GetFiles(folder)
+            .Select(path => path.Replace('\\', '/'))
+            .Where(path => new[] { ".png", ".jpg", ".jpeg" }.Contains(Path.GetExtension(path).ToLowerInvariant()))
+            .ToArray();
+        if (images.Length == 0)
+            return;
+        Shader shader = Shader.Find("Skybox/Panoramic");
+        if (shader == null)
+            throw new Exception("Unity has no Skybox/Panoramic shader to make the skyboxes with");
+        foreach (string image in images)
+        {
+            var importer = AssetImporter.GetAtPath(image) as TextureImporter;
+            if (importer != null)
+            {
+                // Wraps around sideways without a seam, and keeps its detail.
+                importer.textureType = TextureImporterType.Default;
+                importer.textureShape = TextureImporterShape.Texture2D;
+                importer.mipmapEnabled = false;
+                importer.wrapModeU = TextureWrapMode.Repeat;
+                importer.wrapModeV = TextureWrapMode.Clamp;
+                importer.npotScale = TextureImporterNPOTScale.None;
+                importer.maxTextureSize = 8192;
+                importer.SaveAndReimport();
+            }
+            var texture = AssetDatabase.LoadAssetAtPath<Texture2D>(image);
+            if (texture == null)
+                throw new Exception("Unity could not import the skybox image " + image);
+            var material = new Material(shader);
+            material.SetTexture("_MainTex", texture);
+            // Latitude-longitude layout, all 360 degrees.
+            material.SetFloat("_Mapping", 1f);
+            material.SetFloat("_ImageType", 0f);
+            AssetDatabase.CreateAsset(material, Path.ChangeExtension(image, ".mat"));
+        }
+        AssetDatabase.SaveAssets();
     }
 
     static string Argument(string name)
@@ -262,7 +308,7 @@ fn build(request: &BuildRequest, step: &dyn Fn(String)) -> Result<Vec<PathBuf>, 
 }
 
 /// Copies the mod's files from `mod_folder` to `destination`: the manifest,
-/// the music script, the world data and the music (not the readme or earlier builds).
+/// the scripts, the world data, the music and the skies (not the readme or earlier builds).
 fn copy_mod_files(mod_folder: &Path, destination: &Path, file_name: &str) -> Result<(), String> {
     create_folder(destination)?;
     let manifest = format!("{file_name}{}", super::MANIFEST_EXTENSION);
@@ -274,7 +320,7 @@ fn copy_mod_files(mod_folder: &Path, destination: &Path, file_name: &str) -> Res
             copy_file(&entry.path(), &destination.join(entry.file_name()))?;
         }
     }
-    for folder in [super::WORLD_DATA_FOLDER, super::MUSIC_FOLDER] {
+    for folder in [super::WORLD_DATA_FOLDER, super::MUSIC_FOLDER, super::SKY_FOLDER] {
         let source = mod_folder.join(folder);
         let Ok(entries) = std::fs::read_dir(&source) else { continue };
         create_folder(&destination.join(folder))?;

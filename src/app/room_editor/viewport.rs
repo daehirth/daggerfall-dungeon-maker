@@ -239,6 +239,8 @@ impl RoomEditor {
             selected_objects: &selected_objects,
             hovered_objects: &self.viewport.selection_box_objects,
             highlighted_group: None,
+            highlighted_groups: &[],
+            selected_groups: &[],
             placement_preview: self.viewport.placement_preview.as_ref(),
             context_scene: self.dungeon_context.as_ref().map(|context| &context.scene),
             ground_squares: &[],
@@ -251,6 +253,7 @@ impl RoomEditor {
             grid_height: self.grid_height,
             snap_grid_spacing: self.snap.enabled.then_some(self.snap.step),
             size_in_pixels: size_in_pixels(ui, rect),
+            sky: None,
         };
         paint_scene(ui, rect, resources, &mut self.target, &request);
 
@@ -285,7 +288,10 @@ impl RoomEditor {
         resources: &mut EditorResources<'_>,
     ) {
         if response.secondary_clicked() && self.has_multiple_selection() {
-            self.status_message = "Several objects are selected; they can only be moved".into();
+            self.status_message =
+                "Several objects are selected: move them with the arrows, or copy (Ctrl+C), \
+                 duplicate (Ctrl+D) or delete (Del) them"
+                    .into();
             self.viewport.context_object = None;
         } else if response.secondary_clicked() {
             let picked = response.interact_pointer_pos().and_then(|pointer| {
@@ -925,7 +931,10 @@ impl RoomEditor {
                 Some(description) => format!("Selected {description}"),
                 None => String::new(),
             },
-            several => format!("Selected {} objects; drag the arrows to move them together", several.len()),
+            several => format!(
+                "Selected {} objects; drag the arrows to move them together, Ctrl+C to copy them",
+                several.len()
+            ),
         };
     }
 

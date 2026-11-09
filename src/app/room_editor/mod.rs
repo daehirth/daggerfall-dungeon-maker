@@ -20,8 +20,8 @@ use crate::camera::OrbitCamera;
 use crate::encounters::{enemy_chances, DungeonType, EncounterTable, EnemyChance};
 use crate::render::{RoomOutline, ViewSettings, ViewportTarget};
 use crate::scene::{
-    ActionMotion, ObjectAction, ObjectId, Scene, SceneObject, SceneObjectKind, OPEN_DOOR_ACTION,
-    OUTSIDE_CELL_TOLERANCE,
+    ActionMotion, ObjectAction, ObjectId, Scene, SceneObject, SceneObjectKind, ADDED_OBJECTS_GROUP,
+    OPEN_DOOR_ACTION, OUTSIDE_CELL_TOLERANCE,
 };
 use asset_palette::AssetPalette;
 use history::{EditHistory, SceneEdit};
@@ -29,6 +29,31 @@ use viewport::ViewportState;
 
 /// How far a duplicated object is offset from the original, in world units.
 const DUPLICATE_OFFSET: Vec3 = Vec3::new(1.0, 0.0, 0.0);
+/// Numbers every editor made, so copied objects know which editor they came from.
+static NEXT_EDITOR_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Objects copied with Ctrl+C. They are kept in egui's memory, so every cell
+/// editor (the main window's and each cell window's) can paste them.
+#[derive(Clone)]
+struct CopiedObjects {
+    objects: Vec<SceneObject>,
+    /// The editor they were copied in (see [`RoomEditor::instance`]).
+    source: u64,
+    /// The text put on the system clipboard with them. Ctrl+V only reaches
+    /// the program with the clipboard's text, so a paste counts when it
+    /// brings this text back, and not after something else was copied.
+    marker: String,
+    /// The editor pasted into last, and how many times in a row, so each
+    /// paste there lands a little further along.
+    pasted_into: Option<u64>,
+    pastes: u32,
+}
+
+/// Where [`CopiedObjects`] are kept in egui's memory.
+fn copied_objects_id() -> egui::Id {
+    egui::Id::new("ddm_copied_objects")
+}
+
 /// Radius used to frame objects without a mesh (flats and lights), in world units.
 const DEFAULT_FOCUS_RADIUS: f32 = 2.0;
 /// Highest player level offered when previewing random enemies; past it the tables no longer change.
@@ -69,6 +94,8 @@ pub struct RoomEditor {
     title: String,
     /// Prefix for widget ids so several editors can be open at once.
     id: egui::Id,
+    /// Number of this editor, unique for as long as the program runs.
+    instance: u64,
     /// The selected object; with several selected, the one selected last.
     selected_object: Option<usize>,
     /// Every selected object when several are (including `selected_object`). It
@@ -213,6 +240,7 @@ impl RoomEditor {
             scene,
             title,
             id,
+            instance: NEXT_EDITOR_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             selected_object: None,
             selection_set: Vec::new(),
             camera: OrbitCamera::default(),
@@ -598,6 +626,30 @@ impl RoomEditor {
         if context.wants_keyboard_input() {
             return;
         }
+        // Ctrl+C and Ctrl+V arrive as copy and paste events, not as keys.
+        let (copy, pasted) = context.input(|input| {
+            let mut copy = false;
+            let mut pasted = None;
+            for event in &input.events {
+                match event {
+                    egui::Event::Copy => copy = true,
+                    egui::Event::Paste(text) => pasted = Some(text.clone()),
+                    _ => {}
+                }
+            }
+            (copy, pasted)
+        });
+        if copy {
+            self.copy_selection(context);
+        }
+        if let Some(text) = pasted {
+            let ours = context
+                .data(|data| data.get_temp::<CopiedObjects>(copied_objects_id()))
+                .is_some_and(|copied| copied.marker == text);
+            if ours {
+                self.paste(context);
+            }
+        }
         if shortcut(Modifiers::NONE, Key::Delete) {
             self.delete_selection();
         }
@@ -643,8 +695,10 @@ impl RoomEditor {
 
     /// Adds the Edit menu entries.
     pub fn edit_menu(&mut self, ui: &mut egui::Ui) {
-        // Several selected objects can only be moved.
-        let has_selection = self.selected_object.is_some() && !self.has_multiple_selection();
+        let has_selection = self.selected_object.is_some();
+        // Several objects can be copied, duplicated, deleted and moved, but not turned.
+        let has_one = has_selection && !self.has_multiple_selection();
+        let has_copied = ui.ctx().data(|data| data.get_temp::<CopiedObjects>(copied_objects_id())).is_some();
         let menu_button = |ui: &mut egui::Ui, enabled: bool, label: &str, shortcut: &str| {
             let clicked = ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut)).clicked();
             if clicked {
@@ -660,10 +714,16 @@ impl RoomEditor {
             self.redo();
         }
         ui.separator();
+        if menu_button(ui, has_selection, "Copy", "Ctrl+C") {
+            self.copy_selection(ui.ctx());
+        }
+        if menu_button(ui, has_copied, "Paste", "Ctrl+V") {
+            self.paste(ui.ctx());
+        }
         if menu_button(ui, has_selection, "Duplicate", "Ctrl+D") {
             self.duplicate_selection();
         }
-        if menu_button(ui, has_selection, "Rotate 90°", "R") {
+        if menu_button(ui, has_one, "Rotate 90°", "R") {
             self.rotate_selection(90.0);
         }
         if menu_button(ui, has_selection, "Delete", "Del") {
@@ -778,53 +838,149 @@ impl RoomEditor {
         self.select_objects(indices);
     }
 
-    /// Says in the status bar that only moving works with several objects selected,
+    /// Says in the status bar that this cannot be done with several objects
+    /// selected (they can be moved, copied, duplicated and deleted, not turned),
     /// and returns `true` if that is the case.
     fn refuse_for_multiple_selection(&mut self, action: &str) -> bool {
         let count = self.selected_indices().len();
         if count > 1 {
-            self.status_message =
-                format!("Cannot {action} {count} objects at once; several objects can only be moved");
+            self.status_message = format!(
+                "Cannot {action} {count} objects at once; several objects can be moved, copied, duplicated \
+                 or deleted"
+            );
         }
         count > 1
     }
 
-    /// Removes the selected object.
+    /// The selected objects, as many as there are.
+    fn selected_objects(&self) -> Vec<SceneObject> {
+        self.selected_indices()
+            .into_iter()
+            .filter_map(|index| self.scene.objects.get(index).cloned())
+            .collect()
+    }
+
+    /// A short description of `count` objects, the only one by name.
+    fn count_description(objects: &[SceneObject]) -> String {
+        match objects {
+            [object] => object.name.clone(),
+            several => format!("{} objects", several.len()),
+        }
+    }
+
+    /// Removes the selected objects, as one undo step.
     fn delete_selection(&mut self) {
-        if self.refuse_for_multiple_selection("delete") {
+        let mut indices = self.selected_indices();
+        if indices.is_empty() || !self.can_edit() {
             return;
         }
-        let Some(index) = self.selected_object.filter(|&index| index < self.scene.objects.len()) else {
+        indices.sort_unstable();
+        indices.dedup();
+        let mut removed = Vec::with_capacity(indices.len());
+        for &index in indices.iter().rev() {
+            removed.push((index, self.scene.objects.remove(index)));
+        }
+        removed.reverse();
+        let objects: Vec<SceneObject> = removed.iter().map(|(_, object)| object.clone()).collect();
+        self.status_message = format!("Deleted {}", Self::count_description(&objects));
+        // Undoing puts them back from the first place up, so each goes where it was.
+        self.history.record(SceneEdit::Group(
+            removed.into_iter().map(|(index, object)| SceneEdit::Insert { index, object }).collect(),
+        ));
+        self.selected_object = None;
+        self.selection_set.clear();
+    }
+
+    /// Copies the selected objects next to them, and selects the copies.
+    fn duplicate_selection(&mut self) {
+        let originals = self.selected_objects();
+        if originals.is_empty() || !self.can_edit() {
+            return;
+        }
+        self.insert_copies(&originals, DUPLICATE_OFFSET, true);
+        self.status_message = format!("Duplicated {}", Self::count_description(&originals));
+    }
+
+    /// Copies the selected objects (Ctrl+C), to paste them into this cell or
+    /// another with Ctrl+V.
+    fn copy_selection(&mut self, context: &egui::Context) {
+        let objects = self.selected_objects();
+        if objects.is_empty() {
+            self.status_message = "Select objects to copy them".to_string();
+            return;
+        }
+        let description = Self::count_description(&objects);
+        // A different text each time, so an older copy on the clipboard is not mistaken for this one.
+        let marker = format!(
+            "Daggerfall Dungeon Maker: {description} copied ({:.3})",
+            context.input(|input| input.time)
+        );
+        context.copy_text(marker.clone());
+        context.data_mut(|data| {
+            data.insert_temp(
+                copied_objects_id(),
+                CopiedObjects { objects, source: self.instance, marker, pasted_into: None, pastes: 0 },
+            )
+        });
+        self.status_message = format!("Copied {description}; Ctrl+V pastes it into this cell or another");
+    }
+
+    /// Pastes the objects copied last (Ctrl+V), and selects them. Pasted
+    /// into the cell they were copied from, they land next to the originals;
+    /// into another cell, where they were (each further paste a little further along).
+    fn paste(&mut self, context: &egui::Context) {
+        let Some(mut copied) = context.data(|data| data.get_temp::<CopiedObjects>(copied_objects_id()))
+        else {
+            self.status_message = "Nothing is copied: select objects and press Ctrl+C first".to_string();
             return;
         };
         if !self.can_edit() {
             return;
         }
-        let object = self.scene.objects.remove(index);
-        self.status_message = format!("Deleted {}", object.name);
-        self.history.record(SceneEdit::Insert { index, object });
-        self.selected_object = None;
+        let same_cell = copied.source == self.instance;
+        let pastes = match copied.pasted_into == Some(self.instance) {
+            true => copied.pastes + 1,
+            false => u32::from(same_cell),
+        };
+        self.insert_copies(&copied.objects, DUPLICATE_OFFSET * pastes as f32, same_cell);
+        self.status_message = format!("Pasted {}", Self::count_description(&copied.objects));
+        copied.pasted_into = Some(self.instance);
+        copied.pastes = pastes;
+        context.data_mut(|data| data.insert_temp(copied_objects_id(), copied));
     }
 
-    /// Copies the selected object and selects the copy.
-    fn duplicate_selection(&mut self) {
-        if self.refuse_for_multiple_selection("duplicate") {
-            return;
+    /// Adds copies of `originals`, moved by `offset`, with new ids, as one
+    /// undo step, and selects them. Links between the copies follow them;
+    /// links to other objects are kept only in the cell they came from
+    /// (`same_cell`), where those objects are. In another cell the copies go
+    /// into the list of added objects, as the cell's own lists differ.
+    fn insert_copies(&mut self, originals: &[SceneObject], offset: Vec3, same_cell: bool) {
+        let mut next_id = self.scene.new_object_id();
+        let ids: std::collections::HashMap<ObjectId, ObjectId> = originals
+            .iter()
+            .map(|object| {
+                let id = next_id;
+                next_id += 1;
+                (object.id, id)
+            })
+            .collect();
+        let start = self.scene.objects.len();
+        for original in originals {
+            let mut copy = original.clone();
+            copy.id = ids[&original.id];
+            copy.next = original.next.and_then(|next| ids.get(&next).copied().or(same_cell.then_some(next)));
+            copy.position += offset;
+            if !same_cell {
+                copy.group_index = ADDED_OBJECTS_GROUP;
+            }
+            self.scene.objects.push(copy);
         }
-        if self.selected_object.is_none_or(|index| index >= self.scene.objects.len()) || !self.can_edit() {
-            return;
-        }
-        let Some(original) = self.selected_object.and_then(|index| self.scene.objects.get(index)) else {
-            return;
-        };
-        let mut copy = original.clone();
-        copy.position += DUPLICATE_OFFSET;
-        copy.id = self.scene.new_object_id();
-        let copy_index = self.scene.objects.len();
-        self.status_message = format!("Duplicated {}", copy.name);
-        self.scene.objects.push(copy);
-        self.history.record(SceneEdit::Remove { index: copy_index });
-        self.selected_object = Some(copy_index);
+        let end = self.scene.objects.len();
+        // Undoing removes them from the last one back.
+        self.history
+            .record(SceneEdit::Group((start..end).rev().map(|index| SceneEdit::Remove { index }).collect()));
+        self.select_objects((start..end).collect());
+        self.viewport.selection_changed_in_viewport = true;
     }
 
     /// Turns the selected object around the vertical axis by `degrees`.

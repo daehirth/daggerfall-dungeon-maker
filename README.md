@@ -104,6 +104,24 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   made in that window appear in the dungeon view. As in the game, the exit door
   (model 70300) is only kept in the starting cell, labelled **Start**; opening
   a cell on its own with **Open cell…** still shows all of its doors.
+* Clicking a cell selects it; Shift+click adds cells to the selection (or takes
+  one out), and Shift+dragging a box selects every cell whose middle is inside
+  it. Shift+click works in the cell list too; Escape or clicking empty space
+  clears the selection. With two or more cells selected, their right-click menu
+  has **Merge N selected cells**: it makes one new cell of your own from them,
+  named after the dungeon, and puts it in the dungeon in their place. Every
+  object keeps its place in the dungeon: the new cell takes the start cell's
+  grid spot (or, without the start, the one with the lowest grid column, then row), and the
+  other cells' objects reach out past its square. A merged cell has one start
+  marker (and so one water level, the status bar says if they differed), and
+  only the start cell's exit doors stay, as in the game. The cells merged are
+  not changed, and your own cells among them stay in the project. Cell windows
+  that were open close. A cell can use at most 750 different models, so a merge
+  that would need more is refused.
+* With a skybox chosen (see **Skybox** below), the dungeon view draws it behind
+  the dungeon, mapped as Daggerfall Unity maps it, so it faces the same way as
+  in the game. **View > Skybox** turns it off and on. An image that cannot be
+  read is named, with the reason, in the top left of the view.
 * The dungeon view's properties panel (right) shows the dungeon's name, type,
   location (including its region) and cells. Hovering a cell in its list highlights it, and
   double-clicking opens it. The name and type of a project dungeon can be
@@ -184,6 +202,19 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
     files used loose there is no script, so the dungeon plays the song chosen
     under **Music** instead. A file that is missing or not OGG/MP3 is listed as a
     problem and stops the export.
+  * **Skybox**: ticking **Show a sky** shows a sky of your own behind the
+    dungeon instead of Daggerfall's black, seen through any openings to the
+    outside (a broken ceiling, a chasm, an open courtyard). Choose the image in
+    the **Sky image** box below it: a PNG or JPG panorama of the whole sky, twice
+    as wide as it is high (for example 4096 × 2048). Only a `.dfmod` can show it:
+    the export copies the image into the mod's `Sky` folder and adds a C# script
+    (`<mod>DungeonSky.cs.txt`), and the Unity build turns each image into a
+    panoramic skybox material. Inside the dungeon the script makes the camera
+    draw that skybox, and keeps the game's black dungeon fog (which would
+    otherwise cover the sky completely) off it; leaving gives the game's own
+    settings back. With the
+    exported files used loose the dungeon stays black. An image that is missing
+    or not PNG/JPG is listed as a problem and stops the export.
 
   Warnings below list what is still missing: a spot, a spot that is not in the
   sea or already taken (by a Daggerfall location or another project dungeon,
@@ -238,10 +269,19 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
 * Several objects can be selected with Shift+click (in the viewport or the
   outliner; Shift+click a selected object to take it out) or by dragging a box
   over empty space in the viewport: the objects inside it light up, and
-  releasing selects them (Shift adds them to the selection). Several selected
-  objects can only be moved: the gizmo sits at their middle and moves them all
-  together, as one undo step. With grid lock on, the last selected object
-  lands on the grid and the others keep their places relative to it.
+  releasing selects them (Shift adds them to the selection). The gizmo of
+  several selected objects sits at their middle and moves them all together,
+  as one undo step. With grid lock on, the last selected object lands on the
+  grid and the others keep their places relative to it. Several objects can't
+  be turned at once.
+* **Copy and paste**: Ctrl+C (or **Edit > Copy**) copies the selected objects,
+  one or many, and Ctrl+V (**Edit > Paste**) pastes them, selected, as one undo
+  step. Pasted into the same cell they land 1 m along from the originals; into
+  another cell (in the main window or a cell window), where they were. Each
+  further paste lands another 1 m along. The copies get new ids; action links
+  between copied objects follow the copies, and links to other objects are only
+  kept in the cell they were copied from. Ctrl+D duplicates the selected
+  objects and Delete deletes them, however many are selected.
 * A single selected object's gizmo also has three **rotation rings** (red,
   green and blue, around X, Y and Z). Dragging a ring turns the object around
   that axis by the angle the pointer sweeps round the gizmo, in 15° steps with
@@ -363,7 +403,9 @@ dungeons you choose to the game as new locations. The window has:
 * **Files only** or **Build a .dfmod with Unity**: whether to also pack the
   files into a `.dfmod` (a Unity asset bundle). With **Files only**, if a ticked
   dungeon has custom music, the window warns that custom music is not supported
-  in loose files and those dungeons fall back to the game's own music. Tick the platforms to build for;
+  in loose files and those dungeons fall back to the game's own music; if one has
+  a skybox, it warns that skyboxes do not work in loose files and those dungeons
+  stay black. The export still goes ahead. Tick the platforms to build for;
   each gets its own `.dfmod` in a `Windows`, `Linux` or `macOS` folder next to the
   files, and **Copy to Mods folder** also puts this computer's build into
   Daggerfall Unity's `Mods` folder.
