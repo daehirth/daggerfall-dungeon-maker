@@ -1,7 +1,25 @@
 # Daggerfall Dungeon Maker
 
 A CAD-style 3D viewer and editor for the dungeons and dungeon cells (RDB
-blocks) of *The Elder Scrolls II: Daggerfall*, written in Rust.
+blocks) of *The Elder Scrolls II: Daggerfall*, written in Rust. This is a project being continuisly 
+implemented and prooved upon and has the following capabilities so far.
+
+1. Import and view all Daggerfall dungeons and cells.
+2. Create your own project and save it
+3. Create your own Dungeons
+4. Create your own cells
+5. Replace existing dungeons in Daggerfall
+6. Add new dungeons in Daggerfall
+7. Export as a dfmod (requires Unity to be installed) or loose files to be used in DFU.
+8. Use the ingame music system or provide your own MP3 or OGG to play when entering the dungeon (only as a dfmod)
+
+What I plan to add to this in the near future
+
+1. Custom models and textures (most likely only for dfmod)
+2. Texture replacement on models
+3. City, town, village editor with cell editor similar to dungeons
+4. Interior editor for houses
+5. Custom or replace cities/towns/villages
 
 ## Game data
 
